@@ -146,11 +146,14 @@ test("ordinary packet -> mission -> continuation, without a single command", asy
   assert.match(job.objective, /status file/);
   assert.deepEqual(job.acceptance, ["status.json exists", "pushed to origin/main"]);
   assert.equal(job.progress.next_action, "Write status.json.");
+  assert.match(job.rules.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(job.rules.entries.some((r) => r.key === "friction.absorb-noise"), true);
 
   const section = event.systemPromptOptions.sections?.["studio_mission"] ?? "";
   assert.match(section, /STUDIO MISSION/, "the mission contract was injected into the prompt");
   assert.match(section, /OBJECTIVE: Add a status file/, "objective reached the model");
   assert.match(section, /NEXT ACTION: Write status.json/, "next action reached the model");
+  assert.match(section, /friction\.absorb-noise@1/, "forgiving-friction rule reached the model");
   assert.equal(harness.notifications.some((n) => n.includes("mission")), true, "Matthew sees one plain notification, no ritual");
 
   // A small follow-up must not open a second mission.
@@ -177,6 +180,54 @@ test("ordinary packet -> mission -> continuation, without a single command", asy
   const reloaded = readJob(location);
   assert.equal(reloaded.kind, "loaded");
   if (reloaded.kind === "loaded") assert.equal(reloaded.job.continuation.runs, 1, "continuation was counted");
+});
+
+test("ordinary crossed wires are repaired without manufacturing NEEDS_HUMAN", async () => {
+  const { dir } = tempRepo();
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  const location = ledgerLocation(dir);
+
+  await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+
+  const refused = await harness.tools.get("studio_blocked")!.execute(
+    "f1",
+    {
+      kind: "other",
+      reason: "the packet mentions stats.json but the repository appears to use status.json",
+      exact_human_need: "tell me which filename you meant",
+      resume_condition: "filename clarified",
+    },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.equal(refused.isError, true);
+  assert.match(refused.content[0]?.text ?? "", /NEEDS_HUMAN refused/);
+  assert.match(refused.content[0]?.text ?? "", /absorb the noise/i);
+  assert.equal((readJob(location) as any).job.status, "WORKING", "harmless ambiguity did not spend Matthew's attention");
+
+  await harness.tools.get("studio_checkpoint")!.execute(
+    "f2",
+    {
+      reconciliation: "Packet wording said stats.json; live repository and acceptance criteria make status.json unambiguous, so continue with status.json.",
+      next_action: "Write status.json.",
+    },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const repaired = readJob(location);
+  assert.equal(repaired.kind, "loaded");
+  if (repaired.kind !== "loaded") return;
+  assert.equal(repaired.job.progress.reconciliations.length, 1);
+  assert.equal(repaired.job.status, "WORKING");
+
+  const steer: PiBeforeAgentStartEvent = { type: "before_agent_start", prompt: "yes status.json, sorry", systemPrompt: "", systemPromptOptions: {} };
+  await emit(harness, "before_agent_start", steer, ctx);
+  assert.match(steer.systemPromptOptions.sections?.["studio_mission"] ?? "", /LAST RECONCILIATION:/);
+  assert.match(steer.systemPromptOptions.sections?.["studio_mission"] ?? "", /status\.json/);
 });
 
 test("a blocked run stops continuation and asks for exactly one thing", async () => {
