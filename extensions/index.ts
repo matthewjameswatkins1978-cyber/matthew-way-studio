@@ -24,11 +24,12 @@ import { appendEvent, readJob, writeJob, readPacket, type JobReadResult } from "
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitAll, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
-import { applyBlock, applyCheckpoint, applyComplete, applyMemory, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
+import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyMemory, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
 import { discoverLanternTools, lanternContextResult, readSnapshot } from "../src/lantern.js";
 import { isSubstantivePacket, detectControlIntent } from "../src/packet.js";
 import { renderMissionBrief, renderNeedsHuman, renderReceipt } from "../src/receipt.js";
 import { canTransition, progressSignature, terminalStatus, type BlockerKind, type JobState } from "../src/schema.js";
+import { renderRuleSnapshot } from "../src/rules.js";
 
 const STATUS_KEY = "studio";
 const MISSION_SECTION = "studio_mission";
@@ -120,16 +121,10 @@ function missionSection(job: JobState, config: StudioConfig): string {
   return [
     brief,
     "",
-    "STUDIO OPERATING RULES",
-    "- You are running this mission autonomously. Do not ask Matthew to approve an internally sensible plan; do the work.",
-    "- Work the NEXT ACTION now. A turn that only narrates status is not progress.",
-    "- Call studio_checkpoint whenever repo state, evidence, or the next action changes.",
-    "- Call studio_blocked only for something genuinely human-only (credential, access, account action, physical interaction, taste judgement, irreversible choice, external approval).",
-    `- Automatic continuation is bounded: ${config.maxTurns} turns per mission, and ${config.maxUnchangedTurns} turns without measurable progress stops the loop. Never retry an unchanged failure: change approach or block.`,
-    "- Evidence outranks narration: run the cheapest trustworthy check; never claim a push you have not verified.",
-    "- Preserve unrelated work in the tree. Keep changes scoped to the mission.",
-    "- Before finishing: studio_ship (commit/push/verify), then studio_complete for the receipt.",
-    job.blocker ? `- A blocker was recorded earlier (${job.blocker.exact_human_need}); if you worked around it, clear it with studio_checkpoint.` : "",
+    renderRuleSnapshot(job.rules),
+    `- [runtime.bounds] Automatic continuation is bounded: ${config.maxTurns} turns per mission and ${config.maxUnchangedTurns} turns without measurable progress before the stop-loss.`,
+    "- [runtime.reconcile] If a small misunderstanding, stale assumption, typo, or crossed wire is corrected, record it with studio_checkpoint.reconciliation and continue. Do not restart the mission.",
+    job.blocker ? `- [runtime.blocker] A blocker was recorded earlier (${job.blocker.exact_human_need}); if you worked around it, clear it with studio_checkpoint.` : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -156,6 +151,7 @@ function seedMission(ctx: PiContext | PiToolContext, packet: string): { job?: Jo
     branch: job.repo.branch,
     base_sha: job.repo.base_sha,
     packet_bytes: job.packet.bytes,
+    rules_digest: job.rules.digest,
   });
   safeNotify(ctx, `studio: mission ${job.job_id} started — ${job.objective.slice(0, 80)}`, "info");
   return { job, rt, started: true };
@@ -383,6 +379,7 @@ export function registerStudio(pi: PiApi): void {
       branch: Type.Optional(Type.String()),
       attempts: Type.Optional(Type.Number({ description: "Explicit attempt count for the current approach" })),
       child_work: Type.Optional(Type.String({ description: "What any delegated worker is doing, or 'none'" })),
+      reconciliation: Type.Optional(Type.String({ description: "Small corrected assumption/crossed wire; preserves history and continues the same mission" })),
       lantern: Type.Optional(Type.String({ description: "used | not-needed | unavailable" })),
       lantern_refs: Type.Optional(Type.Array(Type.String({ description: "Lantern handles/ids referenced" }))),
       decisions_loaded: Type.Optional(Type.Array(Type.String({ description: "Consequential decisions that bind later work" }))),
@@ -405,6 +402,7 @@ export function registerStudio(pi: PiApi): void {
         branch: str(params["branch"]),
         attempts: num(params["attempts"]),
         child_work: str(params["child_work"]),
+        reconciliation: str(params["reconciliation"]),
         lantern: lanternStatus(str(params["lantern"])),
         lantern_refs: strArray(params["lantern_refs"]),
         decisions_loaded: strArray(params["decisions_loaded"]),
@@ -436,10 +434,12 @@ export function registerStudio(pi: PiApi): void {
     name: "studio_blocked",
     label: "Studio needs-human",
     description:
-      "Enter the resumable NEEDS_HUMAN state for a genuinely human-only dependency (credential, authentication, access, account action, physical interaction, taste judgement, irreversible choice, external approval). Preserves all work, records repo/branch/SHA, and stops automatic continuation.",
+      "Enter the resumable NEEDS_HUMAN state only for a genuinely human-owned dependency. Small mistakes, stale assumptions, crossed wires and ordinary uncertainty must be inferred/rechecked/repaired first. Preserves all work, records repo/branch/SHA, and stops automatic continuation.",
     promptSnippet: "Mark the active mission NEEDS_HUMAN with the exact one thing Matthew must supply.",
     promptGuidelines: [
-      "Use studio_blocked only when Pi truly cannot supply the missing capability itself.",
+      "Use studio_blocked only when Pi truly cannot supply the remaining capability or consequential judgement itself.",
+      "Before blocking, check the live authoritative source, repair obvious crossed wires, and try a materially different valid route when safe.",
+      "For stalled/external-service/other blockers, recovery_attempts must record what was already tried; vague uncertainty is refused.",
       "Before blocking, commit safe durable work and record the exact state so the mission is resumable.",
       "Never ask for the same missing thing twice: reuse the recorded blocker if it is unchanged.",
     ],
@@ -450,6 +450,7 @@ export function registerStudio(pi: PiApi): void {
       resume_condition: Type.String({ description: "What makes the blocker resolved" }),
       next_action: Type.Optional(Type.String({ description: "What Pi will do after rechecking" })),
       state_preserved: Type.Optional(Type.String({ description: "Where the safe work lives (branch/SHA/commits)" })),
+      recovery_attempts: Type.Optional(Type.Array(Type.String({ description: "Safe reconciliation/verification/re-route attempts already made before asking Matthew" }))),
     }),
     execute: async (_id, params, _signal, _update, ctx) => {
       const rt = runtimeFor(ctx);
@@ -464,6 +465,27 @@ export function registerStudio(pi: PiApi): void {
         state_preserved: str(params["state_preserved"]),
       };
       if (!input.exact_human_need.trim()) return textResult("studio_blocked needs one concrete exact_human_need.", undefined, true);
+      if (!input.reason.trim()) return textResult("studio_blocked needs a concrete reason showing why Pi cannot resolve this itself.", undefined, true);
+      if (!input.resume_condition.trim()) return textResult("studio_blocked needs an observable resume_condition.", undefined, true);
+      const recoveryAttempts = strArray(params["recovery_attempts"]);
+      const admission = assessBlockerAdmission(kind, recoveryAttempts);
+      if (!admission.ok) {
+        appendEvent(rt.location, "needs-human-refused", {
+          job_id: job.job_id,
+          kind,
+          reason: admission.reason,
+        });
+        return textResult(
+          [
+            "NEEDS_HUMAN refused — absorb the noise before spending Matthew's attention.",
+            admission.reason,
+            "Use live repository/tool truth to reconcile the likely intent, record any corrected assumption with studio_checkpoint.reconciliation, and try a materially different safe route.",
+            "Call studio_blocked again only if the remaining action or judgement is genuinely Matthew's.",
+          ].join("\n"),
+          { job_id: job.job_id, status: job.status, refused: true },
+          true,
+        );
+      }
       const blocked = applyBlock(job, input);
       writeJob(rt.location, blocked);
       appendEvent(rt.location, "needs-human", {
@@ -471,6 +493,7 @@ export function registerStudio(pi: PiApi): void {
         kind,
         need: input.exact_human_need.slice(0, 200),
         times_raised: blocked.blocker?.times_raised ?? 1,
+        recovery_attempts: recoveryAttempts.length,
       });
       updateStatus(ctx, blocked, rt.config);
       const raised = blocked.blocker?.times_raised ?? 1;
@@ -669,6 +692,8 @@ export function registerStudio(pi: PiApi): void {
         `dirty now: ${rt.facts.dirty ? `${rt.facts.dirty_paths.length} path(s)` : "no"}`,
         `upstream: ${rt.facts.upstream || "(none)"}`,
         `acceptance items: ${job.acceptance.length} · checks passed: ${passed} · checks recorded: ${job.evidence.checks.length}`,
+        `rules: ${job.rules.digest} · ${job.rules.entries.length} active`,
+        `reconciliations: ${job.progress.reconciliations.length}${job.progress.reconciliations.length ? ` · latest: ${job.progress.reconciliations[job.progress.reconciliations.length - 1]?.note.slice(0, 100)}` : ""}`,
         `continuation: ${job.continuation.allowed ? "armed" : "disarmed"} · turn ${job.continuation.runs}/${rt.config.maxTurns} · unchanged ${job.continuation.unchanged_streak}/${rt.config.maxUnchangedTurns} · errors ${job.continuation.error_streak}/${rt.config.maxErrorStreak}`,
         `lantern tools: ${lanternToolNames(pi).join(", ") || "not registered in this session"}`,
       ];
