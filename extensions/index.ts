@@ -293,8 +293,8 @@ export function registerStudio(pi: PiApi): void {
               "studio-stop-loss",
               [
                 `STUDIO STOP-LOSS (${stalled.job_id}): ${decision.reason}.`,
-                'Do not start new work. Call studio_blocked now with kind "stalled", the exact thing you need from Matthew, and the resume condition.',
-                "Then give Matthew the NEEDS_HUMAN summary: what you need, why, what is already complete, repo/branch/SHA, next action after he replies.",
+                "The runtime has already moved this mission to NEEDS_HUMAN and preserved its state. Do not call studio_blocked again.",
+                "Give Matthew the existing NEEDS_HUMAN summary: ask for one steer, explain why, state what is already complete, repo/branch/SHA, and the next action after he replies.",
               ].join("\n"),
               false,
               { job_id: stalled.job_id, reason: decision.reason },
