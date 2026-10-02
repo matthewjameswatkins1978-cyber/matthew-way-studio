@@ -115,7 +115,7 @@ what is true; the model decides what to do.
 ## Verification
 
 ```powershell
-npm test              # typecheck + build + 71 deterministic tests
+npm test              # typecheck + build + 77 deterministic tests
 npm run check:load    # real jiti module load + registration, no inference
 ```
 
