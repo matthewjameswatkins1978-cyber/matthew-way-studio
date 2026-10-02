@@ -127,7 +127,7 @@ export const MATTHEW_WAY_RULES: readonly RuleDefinition[] = [
     revision: 1,
     category: "truth",
     status: "active",
-    statement: "When sources disagree, prefer the live authority for that fact: Git/repository for implementation state, Lantern for remembered context and provenance, Tethers for authority. Preserve meaningful disagreement instead of guessing.",
+    statement: "When sources disagree, prefer the live owner of that fact: Git/repository for implementation state and Lantern for remembered context/provenance. A Tethers decision, when present, owns deterministic consequential authority; its absence never becomes permission. Preserve meaningful disagreement instead of guessing.",
   },
 ];
 
