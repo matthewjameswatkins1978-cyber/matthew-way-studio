@@ -17,6 +17,7 @@ import { makeJobId, savePacket } from "./ledger.js";
 import type { LedgerLocation } from "./paths.js";
 import { compilePacket, parseSections, type ParsedSection } from "./packet.js";
 import type { RepoFacts } from "./git.js";
+import { currentRuleSnapshot } from "./rules.js";
 
 export interface BlockerInput {
   kind: BlockerKind;
@@ -29,6 +30,38 @@ export interface BlockerInput {
 export function blockerSignature(input: BlockerInput): string {
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 200);
   return `${input.kind}::${norm(input.exact_human_need)}::${norm(input.resume_condition)}`;
+}
+
+const DIRECT_HUMAN_KINDS = new Set<BlockerKind>([
+  "credential",
+  "authentication",
+  "access",
+  "account-action",
+  "physical-interaction",
+  "judgement",
+  "irreversible-choice",
+  "external-approval",
+]);
+
+/**
+ * Cheap deterministic friction gate. Ambiguous blockers must show that Studio
+ * already tried to reconcile/verify/re-route before spending Matthew's
+ * attention. Explicitly human-owned capabilities remain direct.
+ */
+export function assessBlockerAdmission(
+  kind: BlockerKind,
+  recoveryAttempts: readonly string[] = [],
+): { ok: boolean; reason: string } {
+  if (DIRECT_HUMAN_KINDS.has(kind)) return { ok: true, reason: "human-owned capability" };
+  const attempts = recoveryAttempts.map((a) => a.trim()).filter(Boolean);
+  if (attempts.length === 0) {
+    return {
+      ok: false,
+      reason:
+        "this blocker is not inherently human-only; first infer safely, check live authoritative state, repair the crossed wire, or try a materially different valid route",
+    };
+  }
+  return { ok: true, reason: `recovery evidence recorded (${attempts.length} attempt${attempts.length === 1 ? "" : "s"})` };
 }
 
 /** Deterministic next action when a packet does not name one. */
@@ -72,11 +105,13 @@ export function startMission(input: {
       next_action: initialNextAction(input.packet, sections),
       attempts: 0,
       child_work: "",
+      reconciliations: [],
     },
     evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [] },
     memory: { lantern: "not-needed", lantern_refs: [], decisions_loaded: [] },
     human_dogfood: { status: "none", checks: [] },
     continuation: { allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, last_signature: "", reason: "mission seeded" },
+    rules: currentRuleSnapshot(),
     packet: packetMeta,
     created_at: input.now ?? new Date().toISOString(),
     updated_at: input.now ?? new Date().toISOString(),
@@ -88,6 +123,8 @@ export interface CheckpointInput {
   next_action?: string;
   attempts?: number;
   child_work?: string;
+  /** Small corrected assumption/crossed wire. Preserved without rewriting mission history. */
+  reconciliation?: string;
   checks?: { name: string; status: "pass" | "fail" | "skip"; detail?: string }[];
   commits?: string[];
   pushed_shas?: string[];
@@ -115,6 +152,17 @@ function uniqueCap(existing: string[], incoming: string[] | undefined, cap: numb
   return [...new Set([...existing, ...incoming])].slice(-cap);
 }
 
+function appendReconciliation(
+  existing: JobState["progress"]["reconciliations"],
+  note: string | undefined,
+): JobState["progress"]["reconciliations"] {
+  const clean = note?.trim();
+  if (!clean) return existing;
+  const previous = existing[existing.length - 1]?.note;
+  if (previous === clean) return existing;
+  return [...existing, { at: new Date().toISOString(), note: clean }].slice(-20);
+}
+
 /**
  * Record observable progress. This is the only sanctioned way to move a blocked
  * mission back to WORKING from inside a turn, so `NEEDS_HUMAN -> WORKING` stays
@@ -128,6 +176,7 @@ export function applyCheckpoint(job: JobState, input: CheckpointInput): JobState
       next_action: input.next_action?.trim() || job.progress.next_action,
       attempts: typeof input.attempts === "number" ? Math.max(0, Math.trunc(input.attempts)) : job.progress.attempts + 1,
       child_work: input.child_work?.trim() || job.progress.child_work,
+      reconciliations: appendReconciliation(job.progress.reconciliations, input.reconciliation),
     },
     evidence: {
       checks: mergeChecks(job.evidence.checks, input.checks),
