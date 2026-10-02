@@ -1,0 +1,31 @@
+{
+  "name": "matthew-way-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Autonomous packet runtime for Pi: paste a software packet into the ordinary composer and Pi runs it to pushed, evidence-backed completion without ritual commands.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "Apache-2.0",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node scripts/run-tests.mjs",
+    "check:load": "node scripts/check-load.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typebox": "^1.3.34",
+    "typescript": "^5.7.2"
+  }
+}
