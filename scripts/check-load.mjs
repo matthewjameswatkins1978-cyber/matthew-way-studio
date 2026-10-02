@@ -12,13 +12,29 @@ import * as path from "node:path";
 const require = createRequire(import.meta.url);
 const root = path.resolve(import.meta.dirname, "..");
 
-let jiti;
-try {
-  jiti = require("jiti")(import.meta.url, { interopDefault: true, tryNative: false });
-} catch {
-  const piPkg = path.join(process.env.APPDATA ?? "", "npm", "node_modules", "@earendil-works", "pi-coding-agent");
-  jiti = require(path.join(piPkg, "node_modules", "jiti"))(import.meta.url, { interopDefault: true });
+function loadJiti() {
+  const candidates = [
+    "jiti",
+    path.join(root, "node_modules", "@earendil-works", "pi-coding-agent", "node_modules", "jiti"),
+  ];
+  const appData = process.env.APPDATA?.trim();
+  if (appData) {
+    candidates.push(path.join(appData, "npm", "node_modules", "@earendil-works", "pi-coding-agent", "node_modules", "jiti"));
+  }
+
+  const failures = [];
+  for (const candidate of candidates) {
+    try {
+      const factory = require(candidate);
+      return factory(import.meta.url, { interopDefault: true, tryNative: false });
+    } catch (error) {
+      failures.push(`${candidate}: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
+    }
+  }
+  throw new Error(`Cannot locate Pi's jiti loader. Tried:\n- ${failures.join("\n- ")}`);
 }
+
+const jiti = loadJiti();
 
 const registered = { tools: [], events: [] };
 const stubPi = {
