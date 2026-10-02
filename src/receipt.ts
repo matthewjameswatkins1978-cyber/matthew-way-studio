@@ -158,6 +158,10 @@ export function renderMissionBrief(job: JobState): string {
     job.constraints.length ? `CONSTRAINTS: ${job.constraints.join(" | ")}` : "",
     job.acceptance.length ? `ACCEPTANCE: ${job.acceptance.join(" | ")}` : "",
     job.attention.length ? `ATTENTION: ${job.attention.join(" | ")}` : "",
+    `RULES: ${job.rules.digest.slice(0, 19)}… (${job.rules.entries.length} active)`,
+    job.progress.reconciliations.length
+      ? `LAST RECONCILIATION: ${job.progress.reconciliations[job.progress.reconciliations.length - 1]?.note}`
+      : "",
     `REPO: ${job.repo.root || "n/a"} branch=${job.repo.branch || "n/a"} base=${job.repo.base_sha.slice(0, 10) || "n/a"} head=${job.repo.current_sha.slice(0, 10) || "n/a"}`,
     job.progress.milestone ? `MILESTONE: ${job.progress.milestone}` : "",
     job.progress.next_action ? `NEXT ACTION: ${job.progress.next_action}` : "",
