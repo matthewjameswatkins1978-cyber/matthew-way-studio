@@ -342,6 +342,8 @@ test("stop-loss converts a stalled loop into a resumable human need", async () =
 
   assert.ok(last, "the boundary kept acting while turns were unproductive");
   assert.equal((last?.entries as any[])?.[0]?.customType, "studio-stop-loss", "the stall became an explicit instruction to block");
+  assert.match((last?.entries as any[])?.[0]?.content ?? "", /already moved this mission to NEEDS_HUMAN/);
+  assert.doesNotMatch((last?.entries as any[])?.[0]?.content ?? "", /Call studio_blocked now/, "stop-loss does not double-record its own blocker");
   const read = readJob(location);
   assert.equal(read.kind === "loaded" && read.job.status, "NEEDS_HUMAN");
   if (read.kind !== "loaded") return;
