@@ -86,7 +86,9 @@ Typos, stale wording, small omissions and obvious crossed wires are not authorit
 events. When the likely intent is cheap and reversible to check, Studio should
 infer it, inspect the live owner of that fact, record a soft reconciliation and
 continue. Git/repository state owns implementation truth; Lantern owns remembered
-context/provenance; Tethers owns consequential authority.
+context/provenance. A Tethers authority decision, when present, owns the
+consequential permission decision; absence of a Tethers decision is never treated
+as permission.
 
 `NEEDS_HUMAN` is reserved for something Matthew genuinely owns: credentials,
 access, account action, physical interaction, product/taste judgement,
