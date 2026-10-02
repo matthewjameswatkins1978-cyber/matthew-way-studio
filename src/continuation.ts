@@ -112,13 +112,13 @@ export function decideContinuation(job: JobState, input: ObserveInput, limits: C
 function buildContinuationInstruction(job: JobState, cont: JobContinuation, progressed: boolean): string {
   const lines = [
     `STUDIO CONTINUATION (${job.job_id}, automatic turn ${cont.runs}).`,
-    progressed ? "Previous turn made measurable progress. Keep going." : "Previous turn changed nothing measurable. Do not repeat the same action: change approach, or record a checkpoint, or declare NEEDS_HUMAN.",
+    progressed ? "Previous turn made measurable progress. Keep going." : "Previous turn changed nothing measurable. Do not repeat the same action: inspect live truth, repair any crossed wire, change approach, or record a checkpoint. Spend Matthew's attention only on a genuinely human-owned dependency.",
     `OBJECTIVE: ${job.objective}`,
   ];
   if (job.progress.milestone) lines.push(`CURRENT MILESTONE: ${job.progress.milestone}`);
   if (job.progress.next_action) lines.push(`NEXT ACTION: ${job.progress.next_action}`);
   if (job.acceptance.length) lines.push(`ACCEPTANCE STILL OPEN: ${remainingAcceptance(job).join(" | ") || "verify each acceptance item against the repository"}`);
-  lines.push("Work the next action now. No summary-only turn. Use studio_checkpoint when state changes, studio_complete when acceptance is met, studio_blocked only for a genuinely human-only dependency.");
+  lines.push("Work the next action now. No summary-only turn. Use studio_checkpoint when state or understanding changes, studio_complete when acceptance is met, and studio_blocked only after harmless ambiguity has been reconciled and the remaining dependency is genuinely human-owned.");
   return lines.join("\n");
 }
 
