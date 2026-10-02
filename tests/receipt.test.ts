@@ -102,7 +102,7 @@ test("NEEDS_HUMAN block states the one need, why, and no commands for Matthew", 
       signature: "credential::token",
       times_raised: 1,
     },
-    progress: { milestone: "M3", next_action: "push and verify SHA", attempts: 2, child_work: "" },
+    progress: { milestone: "M3", next_action: "push and verify SHA", attempts: 2, child_work: "", reconciliations: [] },
     evidence: { checks: [{ name: "npm test", status: "pass", at: "now" }], commits: ["b".repeat(40)], pushed_shas: [], artifacts: [] },
   });
   const text = renderNeedsHuman(blocked, facts, {

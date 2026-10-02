@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { LedgerLocation } from "../src/paths.js";
 import { readPacket, writeJob, readJob } from "../src/ledger.js";
 import {
+  assessBlockerAdmission,
   applyBlock,
   applyCheckpoint,
   applyComplete,
@@ -63,6 +64,8 @@ test("startMission compiles the contract and records the baseline", () => {
   assert.deepEqual(job.acceptance, ["tests pass", "pushed"]);
   assert.match(job.packet.sha256, /^[0-9a-f]{64}$/);
   assert.equal(readPacket(loc, job.job_id)?.includes("Ship the ledger"), true);
+  assert.match(job.rules.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(job.rules.entries.some((r) => r.key === "friction.absorb-noise"), true);
 });
 
 test("initialNextAction takes the first numbered step from the packet", () => {
@@ -87,6 +90,32 @@ test("checkpoint records evidence, caps lists and bumps attempts", () => {
   assert.equal(next.repo.current_sha, "2".repeat(40));
   assert.equal(next.progress.attempts, 1);
   assert.equal(progressSignature(next) !== progressSignature(job), true);
+});
+
+test("a small crossed wire is reconciled in-place and counts as progress", () => {
+  const job = startMission({ packet: PACKET, location: location(), facts: facts() });
+  const before = progressSignature(job);
+  const fixed = applyCheckpoint(job, {
+    reconciliation: "Packet said config.toml, but live repository truth shows settings.toml; using settings.toml.",
+    next_action: "Update settings.toml.",
+  });
+  assert.equal(fixed.status, "WORKING");
+  assert.equal(fixed.progress.reconciliations.length, 1);
+  assert.match(fixed.progress.reconciliations[0]?.note ?? "", /live repository truth/);
+  assert.notEqual(progressSignature(fixed), before, "repairing understanding is measurable progress");
+
+  const duplicate = applyCheckpoint(fixed, {
+    reconciliation: "Packet said config.toml, but live repository truth shows settings.toml; using settings.toml.",
+  });
+  assert.equal(duplicate.progress.reconciliations.length, 1, "identical reconciliation is not spammed");
+});
+
+test("ambiguous blockers must absorb noise before spending human attention", () => {
+  assert.equal(assessBlockerAdmission("credential", []).ok, true, "a credential is genuinely human-owned");
+  const vague = assessBlockerAdmission("other", []);
+  assert.equal(vague.ok, false);
+  assert.match(vague.reason, /infer safely|crossed wire|different valid route/);
+  assert.equal(assessBlockerAdmission("other", ["checked live repo truth and tried the alternate path"]).ok, true);
 });
 
 test("named checkpoints overwrite rather than grow the ledger", () => {

@@ -63,6 +63,15 @@ test("normalizeJob migrates a v0 record forward with defaults", () => {
   assert.equal(job.continuation.allowed, true);
   assert.deepEqual(job.evidence.checks, []);
   assert.equal(job.human_dogfood.status, "none");
+  assert.match(job.rules.digest, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(job.rules.entries.find((r) => r.key === "attention.human-only")?.revision, 1, "legacy mission keeps legacy attention semantics");
+});
+
+test("v2 durable state requires its pinned rules snapshot", () => {
+  assert.throws(
+    () => normalizeJob({ schema_version: SCHEMA_VERSION, objective: "x", status: "WORKING" }),
+    /no rules snapshot/,
+  );
 });
 
 test("normalizeJob rejects a newer schema instead of guessing", () => {
@@ -91,6 +100,7 @@ test("normalizeJob tolerates junk lists and coerces check statuses", () => {
 
 test("progressSignature changes only on observable progress", () => {
   const a = baseJob();
+  assert.equal(a.rules.entries.some((r) => r.key === "friction.absorb-noise"), true);
   const b: JobState = { ...a, progress: { ...a.progress, milestone: "ledger done" } };
   assert.notEqual(progressSignature(a), progressSignature(b));
   const c: JobState = { ...a, created_at: "2020-01-01T00:00:00Z" };

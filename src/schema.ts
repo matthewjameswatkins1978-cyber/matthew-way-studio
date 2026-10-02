@@ -10,7 +10,9 @@
  * NEEDS_HUMAN is a first-class resumable state, not a failure.
  */
 
-export const SCHEMA_VERSION = 1;
+import { currentRuleSnapshot, legacyRuleSnapshot, parseRuleSnapshot, type RuleSnapshot } from "./rules.js";
+
+export const SCHEMA_VERSION = 2;
 
 export const STATUSES = ["WORKING", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"] as const;
 export type JobStatus = (typeof STATUSES)[number];
@@ -67,11 +69,18 @@ export interface JobRepo {
   dirty_at_start: boolean;
 }
 
+export interface JobReconciliation {
+  at: string;
+  note: string;
+}
+
 export interface JobProgress {
   milestone: string;
   next_action: string;
   attempts: number;
   child_work: string;
+  /** Small corrected assumptions/crossed wires. They preserve history without restarting the mission. */
+  reconciliations: JobReconciliation[];
 }
 
 export interface JobEvidence {
@@ -126,6 +135,8 @@ export interface JobState extends JobContract {
   blocker?: JobBlocker;
   human_dogfood: JobDogfood;
   continuation: JobContinuation;
+  /** Exact operating rules pinned when the mission began. */
+  rules: RuleSnapshot;
   packet: { sha256: string; bytes: number; path: string };
   result?: { outcome: "COMPLETE" | "PARTIAL" | "FAILED"; summary: string; receipt?: string };
   created_at: string;
@@ -202,6 +213,19 @@ export function normalizeJob(raw: unknown): JobState {
   const now = new Date().toISOString();
 
   const lanternMemory = str(memory.lantern);
+  let rules: RuleSnapshot;
+  if (obj.rules === undefined) {
+    if (version >= 2) throw new JobParseError("job state v2 has no rules snapshot");
+    // v0/v1 missions predate explicit rules. Pin their original behaviour
+    // rather than silently upgrading an in-flight mission to today's rules.
+    rules = legacyRuleSnapshot();
+  } else {
+    try {
+      rules = parseRuleSnapshot(obj.rules);
+    } catch (error) {
+      throw new JobParseError(`invalid rules snapshot: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   const job: JobState = {
     schema_version: SCHEMA_VERSION,
@@ -226,6 +250,13 @@ export function normalizeJob(raw: unknown): JobState {
       next_action: str(progress.next_action),
       attempts: clampInt(progress.attempts, 0, 0),
       child_work: str(progress.child_work),
+      reconciliations: Array.isArray(progress.reconciliations)
+        ? progress.reconciliations
+            .map((r) => r as Record<string, unknown>)
+            .filter((r) => typeof r?.note === "string" && r.note.trim().length > 0)
+            .map((r) => ({ at: typeof r.at === "string" ? r.at : now, note: String(r.note).trim() }))
+            .slice(-20)
+        : [],
     },
     evidence: {
       checks: Array.isArray(evidence.checks)
@@ -260,6 +291,7 @@ export function normalizeJob(raw: unknown): JobState {
       last_signature: str(cont.last_signature),
       reason: str(cont.reason),
     },
+    rules,
     packet: {
       sha256: str(packet.sha256),
       bytes: clampInt(packet.bytes, 0, 0),
@@ -309,7 +341,7 @@ export function newJob(input: {
     status: "WORKING",
     ...input.contract,
     repo: input.repo,
-    progress: { milestone: "", next_action: input.nextAction, attempts: 0, child_work: "" },
+    progress: { milestone: "", next_action: input.nextAction, attempts: 0, child_work: "", reconciliations: [] },
     evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [] },
     memory: { lantern: "not-needed", lantern_refs: [], decisions_loaded: [] },
     human_dogfood: { status: "none", checks: [] },
@@ -321,6 +353,7 @@ export function newJob(input: {
       last_signature: "",
       reason: "mission seeded",
     },
+    rules: currentRuleSnapshot(),
     packet: input.packet,
     created_at: now,
     updated_at: now,
@@ -338,6 +371,7 @@ export function progressSignature(job: JobState): string {
     job.progress.next_action.slice(0, 120),
     job.evidence.checks.length,
     job.evidence.commits.length,
+    job.progress.reconciliations.length,
   ].join("|");
 }
 

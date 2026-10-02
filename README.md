@@ -31,8 +31,9 @@ pi --extension .\extensions\index.ts
 |---|---|
 | Substantive packet, no active mission | Compiles OBJECTIVE / SCOPE / AUTHORITY / CONSTRAINTS / ACCEPTANCE / ATTENTION, writes durable state, stores the packet verbatim, starts working without asking for plan approval |
 | Small request | Stays ordinary work. No project is manufactured |
+| Small mistake / crossed wire | Studio prefers live authoritative truth, records a soft reconciliation, and carries on without creating a new mission or asking Matthew unnecessarily |
 | End of a turn while `WORKING` | Checkpoints, decides the next action, requests the next turn automatically |
-| Genuinely human-only dependency | `NEEDS_HUMAN`: what is needed, why, what is already complete, repo/branch/SHA, next action |
+| Genuinely human-only dependency | `NEEDS_HUMAN`: what is needed, why, what is already complete, repo/branch/SHA, next action. Ambiguous `other` / external-service blockers must show a safe reconciliation or reroute attempt first |
 | Ordinary reply to a blocker | Rechecks the real capability instead of trusting the wording, then resumes |
 | Completion | `COMPLETE` is refused without machine evidence, a revision and a verified remote SHA; emits the concise receipt |
 
@@ -55,19 +56,53 @@ Non-git folders fall back to `<cwd>/.pi/matthew-way-studio/`.
 
 A mission survives context compaction, Pi restart, session restart, model
 replacement and child-agent replacement, because none of those hold the truth.
+Each new mission also snapshots the exact active Matthew Way rules and their
+SHA-256 digest. Updating the rules later cannot silently change work already in
+flight; pre-0.2 missions migrate onto the original 0.1 behaviour snapshot.
 
 ## Model-callable tools
 
 Registered on Pi's ordinary tool surface. Matthew never names them.
 
 - `studio_checkpoint` — milestone, next action, checks, commits, pushed SHAs,
-  Lantern usage. Also the sanctioned `NEEDS_HUMAN -> WORKING` edge.
-- `studio_blocked` — enter `NEEDS_HUMAN` with one concrete human need.
+  Lantern usage and small reconciliations. Also the sanctioned
+  `NEEDS_HUMAN -> WORKING` edge.
+- `studio_blocked` — enter `NEEDS_HUMAN` with one concrete human need. It
+  refuses ordinary ambiguity until Studio has tried to infer safely, inspect
+  live truth, repair the crossed wire or reroute.
 - `studio_ship` — commit (opt-in), push, verify the remote SHA. Never
   force-pushes, never merges review branches on Matthew or Lucy's behalf.
 - `studio_complete` — evidence-gated `COMPLETE | PARTIAL | FAILED` + receipt.
 - `studio_status` — read the durable mission after compaction or restart.
 - `studio_context` — narrow Lantern retrieval with honest degradation.
+
+## Forgiving at the edge, strict at the effect
+
+Studio follows one deliberately asymmetric rule:
+
+> **Absorb noise. Surface consequences.**
+
+Typos, stale wording, small omissions and obvious crossed wires are not authority
+events. When the likely intent is cheap and reversible to check, Studio should
+infer it, inspect the live owner of that fact, record a soft reconciliation and
+continue. Git/repository state owns implementation truth; Lantern owns remembered
+context/provenance. A Tethers authority decision, when present, owns the
+consequential permission decision; absence of a Tethers decision is never treated
+as permission.
+
+`NEEDS_HUMAN` is reserved for something Matthew genuinely owns: credentials,
+access, account action, physical interaction, product/taste judgement,
+irreversible choice, external approval, or a stop-loss after repeated lack of
+measurable progress. The forgiving edge never weakens evidence-gated completion
+or consequential authority.
+
+## Canonical rules
+
+The active operating rules live together in `src/rules.ts`. Every rule has a
+semantic key, revision, category and status. A replacement explicitly
+supersedes an earlier revision; timestamps do not silently decide precedence.
+Rule-set validation rejects duplicate/contradictory active revisions, and every
+mission persists a self-verifying snapshot digest.
 
 ## Bounded autonomy
 
@@ -101,7 +136,8 @@ src/ledger.ts         atomic snapshot, events, packet store
 src/paths.ts          git common dir resolution, command runner
 src/git.ts            repo facts, remote SHA verification, push, commit
 src/packet.ts         packet classification and contract compilation (pure)
-src/mission.ts        every legal transition, completion gate (pure)
+src/mission.ts        every legal transition, completion gate, reconciliation (pure)
+src/rules.ts          canonical versioned rules, supersession + pinned snapshots
 src/continuation.ts   stop-loss and run allowance decision (pure)
 src/receipt.ts        NEEDS_HUMAN block, completion receipt, mission brief
 src/lantern.ts        narrow retrieval adapter with staleness guard
@@ -115,7 +151,7 @@ what is true; the model decides what to do.
 ## Verification
 
 ```powershell
-npm test              # typecheck + build + 77 deterministic tests
+npm test              # typecheck + build + deterministic tests
 npm run check:load    # real jiti module load + registration, no inference
 ```
 
