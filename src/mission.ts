@@ -6,6 +6,7 @@
  */
 
 import {
+  SCHEMA_VERSION,
   applyTransition,
   canTransition,
   terminalStatus,
@@ -88,7 +89,7 @@ export function startMission(input: {
   const jobId = makeJobId(`${input.facts.root}:${input.facts.branch}:${input.facts.head_sha}:${contract.objective}`);
   const packetMeta = savePacket(input.location, jobId, input.packet);
   return {
-    schema_version: 1,
+    schema_version: SCHEMA_VERSION,
     job_id: jobId,
     status: "WORKING",
     ...contract,
