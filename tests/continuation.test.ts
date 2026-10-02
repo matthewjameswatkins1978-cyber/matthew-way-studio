@@ -73,7 +73,7 @@ test("run allowance is a hard ceiling", () => {
 test("progress clears both error and unchanged streaks", () => {
   const streaked = job({
     continuation: { allowed: true, runs: 3, unchanged_streak: 2, error_streak: 2, last_signature: "old", reason: "" },
-    progress: { milestone: "new", next_action: "ship", attempts: 4, child_work: "" },
+    progress: { milestone: "new", next_action: "ship", attempts: 4, child_work: "", reconciliations: [] },
   });
   const decision = decideContinuation(streaked, ok);
   assert.equal(decision.action, "continue");
