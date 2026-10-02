@@ -464,7 +464,7 @@ test("studio_context prefers live Lantern and degrades honestly", async () => {
   const snapshotTool = harness.tools.get("studio_context")!;
   const snapshot = await snapshotTool.execute("c3", { query: "lantern runtime verification" }, undefined, undefined, ctxFor(dir, harness, { tools: [{ name: "read" }] }));
   const snapshotText = snapshot.content[0]?.text ?? "";
-  assert.match(snapshotText, /LANTERN (SNAPSHOT|: unavailable)/);
+  assert.match(snapshotText, /LANTERN(?: SNAPSHOT|: unavailable)/);
   if (/LANTERN SNAPSHOT/.test(snapshotText)) {
     assert.match(snapshotText, /degraded read-only snapshot/);
     assert.equal((readJob(location) as any).job.memory.lantern, "used");
