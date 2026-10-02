@@ -133,3 +133,15 @@ test("mission brief stays compact and names the packet file", () => {
 test("machineEvidence reports nothing as nothing", () => {
   assert.equal(machineEvidence(job()), "none recorded");
 });
+
+test("IMPORTANT DECISIONS never disguises scope as a decision", () => {
+  assert.match(renderReceipt(job(), facts), /IMPORTANT DECISIONS\nnone recorded/);
+  const decided = job({ memory: { lantern: "not-needed", lantern_refs: [], decisions_loaded: ["state lives in the git common dir"] } });
+  assert.match(renderReceipt(decided, facts), /IMPORTANT DECISIONS\n- state lives in the git common dir/);
+});
+
+test("a relative local remote is shown with the repository root", () => {
+  const local = job({ repo: { root: "/srv/build/widget", remote: "../widget.git", branch: "main", base_sha: "a", current_sha: "b", dirty_at_start: false } });
+  assert.match(renderReceipt(local, facts), /REPO\n\.\.\/widget\.git \(\/srv\/build\/widget\)/);
+  assert.match(renderReceipt(job(), facts), /^REPO\nacme\/widget$/m, "a hosted remote stays canonical and bare");
+});

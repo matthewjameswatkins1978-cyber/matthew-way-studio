@@ -622,16 +622,18 @@ export function registerStudio(pi: PiApi): void {
           true,
         );
       }
-      const receiptDraft = renderReceipt(candidate, rt.facts, { push_verified: pushVerified });
-      const finalJob = applyComplete(
+      // Render after the transition: a stored receipt must never describe a
+      // mission it just closed as still WORKING.
+      const completed = applyComplete(
         candidate,
         { outcome, summary, head_sha: head, branch, remote: job.repo.remote || rt.facts.remote, pushed_sha: pushed, push_verified: pushVerified, dogfood },
-        receiptDraft,
+        "",
       );
+      const receipt = renderReceipt(completed, rt.facts, { push_verified: pushVerified });
+      const finalJob: JobState = completed.result ? { ...completed, result: { ...completed.result, receipt } } : completed;
       writeJob(rt.location, finalJob, { backup: true });
       appendEvent(rt.location, "complete", { job_id: finalJob.job_id, outcome, sha: finalJob.repo.current_sha, push_verified: pushVerified === true });
       updateStatus(ctx, finalJob, rt.config);
-      const receipt = renderReceipt(finalJob, rt.facts, { push_verified: pushVerified });
       safeNotify(ctx, `studio: ${outcome} — ${finalJob.job_id}`, outcome === "COMPLETE" ? "info" : "warning");
       return textResult(receipt, { job_id: finalJob.job_id, outcome, sha: finalJob.repo.current_sha, push_verified: pushVerified === true });
     },

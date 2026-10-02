@@ -33,6 +33,23 @@ export function machineEvidence(job: JobState): string {
   );
 }
 
+/**
+ * Canonical remote for a receipt. A relative or local-path remote is shown with
+ * the repository root, so a receipt never names an ambiguous "../remote.git".
+ */
+export function repoLabel(job: JobState, facts: RepoFacts): string {
+  const raw = job.repo.remote || facts.remote || "";
+  const canonical = canonicalRepo(raw);
+  const root = job.repo.root || facts.root || "";
+  if (!canonical) return root || "not a repository";
+  // Only a real hosted remote form is shown bare. A relative or local-path
+  // remote is ambiguous without the repository root beside it.
+  const hostedRemote = /^(git@[\w.-]+:|ssh:\/\/|https?:\/\/)/.test(raw.trim());
+  const canonicalShape = /^[\w.-]+\/[\w.-]+$/.test(canonical);
+  const bare = (hostedRemote && canonicalShape) || !root;
+  return bare ? canonical : `${canonical} (${root})`;
+}
+
 export function renderReceipt(job: JobState, facts: RepoFacts, input: { push_verified?: boolean } = {}): string {
   const outcome = job.result?.outcome ?? job.status;
   const lines = [
@@ -40,7 +57,7 @@ export function renderReceipt(job: JobState, facts: RepoFacts, input: { push_ver
     "",
     section("OBJECTIVE", job.objective),
     "",
-    section("REPO", canonicalRepo(job.repo.remote || facts.remote) || job.repo.root || "not a repository"),
+    section("REPO", repoLabel(job, facts)),
     "",
     section("BRANCH", job.repo.branch || facts.branch || "unknown"),
     "",
@@ -52,7 +69,7 @@ export function renderReceipt(job: JobState, facts: RepoFacts, input: { push_ver
     "",
     section(
       "IMPORTANT DECISIONS",
-      job.memory.decisions_loaded.length ? list(job.memory.decisions_loaded) : list(job.scope.slice(0, 6), "") || "none recorded",
+      job.memory.decisions_loaded.length ? list(job.memory.decisions_loaded) : "none recorded",
     ),
     "",
     section("LANTERN", lanternLine(job)),
@@ -110,7 +127,7 @@ export function renderNeedsHuman(
     "",
     section("ALREADY COMPLETE", alreadyComplete(job)),
     "",
-    section("STATE", `${canonicalRepo(job.repo.remote || facts.remote) || job.repo.root || "local folder"} / ${job.repo.branch || facts.branch || "no branch"} / ${job.repo.current_sha || facts.head_sha || "no SHA"}`),
+    section("STATE", `${repoLabel(job, facts)} / ${job.repo.branch || facts.branch || "no branch"} / ${job.repo.current_sha || facts.head_sha || "no SHA"}`),
     "",
     "WHEN YOU HAVE DONE IT",
     "Reply normally. No special command required.",

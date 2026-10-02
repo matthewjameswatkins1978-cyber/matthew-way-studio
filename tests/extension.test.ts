@@ -267,6 +267,10 @@ test("a normal reply resumes the blocked mission and completion yields a receipt
 
   const final = readJob(location);
   assert.equal(final.kind === "loaded" && final.job.status, "COMPLETE");
+  if (final.kind === "loaded") {
+    assert.match(final.job.result?.receipt ?? "", /^RESULT: COMPLETE\n/, "the stored receipt describes the closed mission");
+    assert.match(final.job.result?.receipt ?? "", /IMPORTANT DECISIONS\nnone recorded/, "scope is not presented as a decision");
+  }
   const settle = (await emit(harness, "agent_before_settle", boundaryEvent(), ctx)) as PiBoundaryResult | undefined;
   assert.equal(settle, undefined, "a completed mission does not continue");
   assert.equal(readEvents(location).some((e) => e.type === "complete"), true);
