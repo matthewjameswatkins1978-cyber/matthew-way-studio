@@ -26,9 +26,11 @@ function run(cmd, args, env) {
 
 run("npx", ["tsc", "--noEmit", "-p", "tsconfig.json"]);
 run("npx", ["tsc", "-p", "tsconfig.json"]);
-const dir = path.join(root, "dist", "tests");
 const files = fs
-  .readdirSync(dir)
-  .filter((f) => f.endsWith(".test.js"))
-  .map((f) => path.join("dist", "tests", f));
+  .readdirSync(path.join(root, "tests"))
+  .filter((f) => f.endsWith(".test.ts"))
+  .map((f) => path.join("dist", "tests", f.replace(/\.ts$/, ".js")));
+for (const file of files) {
+  if (!fs.existsSync(path.join(root, file))) throw new Error(`Missing compiled test: ${file}`);
+}
 run("node", ["--test", ...files]);

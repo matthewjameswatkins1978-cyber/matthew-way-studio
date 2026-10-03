@@ -118,6 +118,8 @@ export interface PiApi {
   on(event: "agent_settled", handler: (event: { type: "agent_settled" }, ctx: PiContext) => Promise<void> | void): () => void;
   on(event: "session_shutdown", handler: (event: { type: "session_shutdown"; reason: string }, ctx: PiContext) => Promise<void> | void): () => void;
   registerTool(def: PiToolDefinition): void;
+  registerCommand?(name: string, options: { description?: string; handler: (args: string, ctx: PiContext) => Promise<void> }): void;
+  sendUserMessage?(content: string): void;
   getAllTools(): PiToolInfo[];
 }
 

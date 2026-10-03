@@ -36,7 +36,7 @@ function loadJiti() {
 
 const jiti = loadJiti();
 
-const registered = { tools: [], events: [] };
+const registered = { tools: [], events: [], commands: [] };
 const stubPi = {
   on(event, handler) {
     registered.events.push(event);
@@ -45,6 +45,10 @@ const stubPi = {
   registerTool(def) {
     registered.tools.push(def.name);
   },
+  registerCommand(name) {
+    registered.commands.push(name);
+  },
+  sendUserMessage() {},
   getAllTools: () => [{ name: "read" }],
 };
 
@@ -52,6 +56,7 @@ const mod = jiti(path.join(root, "extensions", "index.ts"));
 const target = mod?.default ?? mod;
 target(stubPi);
 
+if (!registered.commands.includes("studio")) throw new Error("Studio compatibility command did not register");
 if (registered.tools.length < 5) {
   console.error(`LOAD FAIL: only ${registered.tools.length} tools registered`);
   process.exit(1);

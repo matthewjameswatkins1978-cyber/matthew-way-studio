@@ -104,6 +104,13 @@ export const LEGACY_RULES: readonly RuleDefinition[] = [...SHARED_RULES, LEGACY_
 export const MATTHEW_WAY_RULES: readonly RuleDefinition[] = [
   ...SHARED_RULES,
   {
+    key: "scope.threadmoth-first",
+    revision: 1,
+    category: "scope",
+    status: "active",
+    statement: "Use Threadmoth by default for supported file edits: preview, mutate, then verify the certificate. Fall back only when it genuinely cannot express the edit; explain why. Use ordinary tools for Git, builds, tests and read-only inspection.",
+  },
+  {
     ...LEGACY_ATTENTION_RULE,
     status: "superseded",
   },

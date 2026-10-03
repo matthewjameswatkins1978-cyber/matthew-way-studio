@@ -48,7 +48,7 @@ test("an errored turn does not extend the loop indefinitely", () => {
     state = { ...state, continuation: decision.continuation };
   }
   assert.deepEqual(actions.slice(0, 2), ["continue", "stall"], "second identical failure stops the loop");
-  assert.equal(actions[2], "stall", "a stalled mission stays stopped");
+  assert.equal(actions[2], "settle", "a stalled mission stays idle without polling");
 });
 
 test("a user abort never auto-continues", () => {
@@ -61,6 +61,14 @@ test("NEEDS_HUMAN and terminal states stop continuation", () => {
   assert.equal(decideContinuation(job({ status: "NEEDS_HUMAN" }), ok).action, "settle");
   assert.equal(decideContinuation(job({ status: "COMPLETE" }), ok).action, "settle");
   assert.equal(decideContinuation(job({ status: "PARTIAL" }), ok).action, "settle");
+});
+
+test("an explicit hold stays quiet until a human resumes it", () => {
+  const held = job({ continuation: { ...job().continuation, allowed: false, reason: "execution held by packet" } });
+  const decision = decideContinuation(held, ok);
+  assert.equal(decision.action, "settle");
+  assert.equal(decision.continuation.runs, 0);
+  assert.equal(decision.continuation.allowed, false);
 });
 
 test("run allowance is a hard ceiling", () => {

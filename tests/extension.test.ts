@@ -126,6 +126,24 @@ function boundaryEvent(entries: unknown[] = []): PiBoundaryEvent {
   return { type: "agent_before_settle", outcome: "completed", entries, continue: false, context: { canContinue: false } };
 }
 
+test("optional legacy command forwards into the ordinary packet path", async () => {
+  const harness = makeHarness();
+  const sent: string[] = [];
+  let handler: ((args: string, ctx: PiContext) => Promise<void>) | undefined;
+  harness.api.registerCommand = (name, options) => {
+    assert.equal(name, "studio");
+    handler = options.handler;
+  };
+  harness.api.sendUserMessage = (content) => sent.push(content);
+  registerStudio(harness.api);
+  assert.ok(handler);
+  const { dir } = tempRepo();
+  const ctx = ctxFor(dir, harness);
+  await handler!(PACKET, ctx);
+  await handler!("start", ctx);
+  assert.deepEqual(sent, [PACKET.trim(), "go ahead"]);
+});
+
 test("ordinary packet -> mission -> continuation, without a single command", async () => {
   const { dir } = tempRepo();
   const harness = makeHarness();
@@ -180,6 +198,31 @@ test("ordinary packet -> mission -> continuation, without a single command", asy
   const reloaded = readJob(location);
   assert.equal(reloaded.kind, "loaded");
   if (reloaded.kind === "loaded") assert.equal(reloaded.job.continuation.runs, 1, "continuation was counted");
+});
+
+test("plan-only packet checkpoints once and stays idle until go-ahead", async () => {
+  const { dir } = tempRepo();
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  const packet = `${PACKET}\n\nPlan only. Do not execute yet.`;
+  const event: PiBeforeAgentStartEvent = { type: "before_agent_start", prompt: packet, systemPrompt: "", systemPromptOptions: {} };
+  await emit(harness, "before_agent_start", event, ctx);
+  assert.match(event.systemPromptOptions.sections?.["studio_mission"] ?? "", /STUDIO HOLD/);
+  const held = readJob(ledgerLocation(dir));
+  assert.equal(held.kind, "loaded");
+  if (held.kind !== "loaded") return;
+  assert.equal(held.job.continuation.allowed, false);
+  assert.equal(await emit(harness, "agent_before_settle", boundaryEvent(), ctx), undefined);
+  assert.equal(await emit(harness, "agent_before_settle", boundaryEvent(), ctx), undefined);
+  const stillHeld = readJob(ledgerLocation(dir));
+  assert.equal(stillHeld.kind, "loaded");
+  if (stillHeld.kind !== "loaded") return;
+  assert.equal(stillHeld.job.continuation.runs, 0);
+  await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: "go ahead", systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  const resumed = readJob(ledgerLocation(dir));
+  assert.equal(resumed.kind, "loaded");
+  if (resumed.kind === "loaded") assert.equal(resumed.job.continuation.allowed, true);
 });
 
 test("ordinary crossed wires are repaired without manufacturing NEEDS_HUMAN", async () => {

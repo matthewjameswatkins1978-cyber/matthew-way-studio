@@ -230,6 +230,6 @@ export function detectControlIntent(text: string): "pause" | "resume" | undefine
   if (PAUSE_PATTERNS.some((p) => p.test(trimmed))) return "pause";
   const lower = trimmed.toLowerCase();
   if (/\b(resume|continue|carry on|keep going|pick it up|renew)\b/.test(lower) && /\b(mission|job|run|loop|studio|work)\b/.test(lower)) return "resume";
-  if (lower === "continue" || lower === "resume" || lower === "keep going") return "resume";
+  if (lower === "continue" || lower === "resume" || lower === "keep going" || lower === "/studio start" || lower === "go ahead" || lower === "start now") return "resume";
   return undefined;
 }

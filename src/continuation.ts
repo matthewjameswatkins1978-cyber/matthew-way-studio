@@ -63,6 +63,11 @@ export function decideContinuation(job: JobState, input: ObserveInput, limits: C
     return { action: "settle", reason: next.reason, continuation: next };
   }
 
+  if (!previous.allowed) {
+    next.reason = previous.reason || "automatic continuation is paused";
+    return { action: "settle", reason: next.reason, continuation: next };
+  }
+
   if (input.aborted) {
     next.allowed = false;
     next.reason = "user interrupted this run";

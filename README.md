@@ -30,6 +30,7 @@ pi --extension .\extensions\index.ts
 | Moment | Behaviour |
 |---|---|
 | Substantive packet, no active mission | Compiles OBJECTIVE / SCOPE / AUTHORITY / CONSTRAINTS / ACCEPTANCE / ATTENTION, writes durable state, stores the packet verbatim, starts working without asking for plan approval |
+| Explicit "plan only", "read only", or approval hold | Records the packet and plan, then remains idle until an ordinary go-ahead or optional `/studio start` |
 | Small request | Stays ordinary work. No project is manufactured |
 | Small mistake / crossed wire | Studio prefers live authoritative truth, records a soft reconciliation, and carries on without creating a new mission or asking Matthew unnecessarily |
 | End of a turn while `WORKING` | Checkpoints, decides the next action, requests the next turn automatically |
@@ -162,14 +163,15 @@ actual extension through a stub Pi harness for the four behaviours that matter.
 
 No GUI automation: real dogfood is Matthew's job.
 
-## Relationship to Pi Studio's saved plans
+## Single Pi Studio path
 
-Pi Studio already persists `StudioRun` records (milestones, worker threads,
-GitHub checkpoints) through `list_studio_runs` / `save_studio_run`. That is a
-different authority: a saved plan for orchestrated, milestone-shaped work.
-This runtime does not read or duplicate it. The job ledger is the live mission
-state for whatever Matthew just pasted, including work that never becomes a
-plan. One is not a copy of the other, and neither invents a second harness.
+This package is the canonical Studio runtime for ordinary Pi and Pi GUI composer packets.
+The older global `/studio` extension and Pi GUI `StudioRun` planning tool are legacy paths;
+do not invoke them for a new mission. The active mission ledger in the Git common directory
+is the single reload path. Existing Pi Studio role preferences in
+`~/.pi/agent/studio-models.json` are shown to the coordinator as unverified preferences.
+The coordinator must check Pi's live model catalog and authentication before routing;
+they never authorize a metered fallback.
 
 ## Prior art and provenance
 

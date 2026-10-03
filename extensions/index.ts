@@ -30,6 +30,8 @@ import { isSubstantivePacket, detectControlIntent } from "../src/packet.js";
 import { renderMissionBrief, renderNeedsHuman, renderReceipt } from "../src/receipt.js";
 import { canTransition, progressSignature, terminalStatus, type BlockerKind, type JobState } from "../src/schema.js";
 import { renderRuleSnapshot } from "../src/rules.js";
+import { rolePreferenceSection } from "../src/roles.js";
+import { requestsExecutionHold } from "../src/authority.js";
 
 const STATUS_KEY = "studio";
 const MISSION_SECTION = "studio_mission";
@@ -122,6 +124,8 @@ function missionSection(job: JobState, config: StudioConfig): string {
     brief,
     "",
     renderRuleSnapshot(job.rules),
+    rolePreferenceSection(),
+    !job.continuation.allowed ? "STUDIO HOLD: execution is paused by the packet or Matthew. Explain the plan once and wait for an explicit go-ahead; do not poll or request automatic continuation." : "",
     `- [runtime.bounds] Automatic continuation is bounded: ${config.maxTurns} turns per mission and ${config.maxUnchangedTurns} turns without measurable progress before the stop-loss.`,
     "- [runtime.reconcile] If a small misunderstanding, stale assumption, typo, or crossed wire is corrected, record it with studio_checkpoint.reconciliation and continue. Do not restart the mission.",
     job.blocker ? `- [runtime.blocker] A blocker was recorded earlier (${job.blocker.exact_human_need}); if you worked around it, clear it with studio_checkpoint.` : "",
@@ -144,6 +148,10 @@ function seedMission(ctx: PiContext | PiToolContext, packet: string): { job?: Jo
     });
   }
   const job = startMission({ packet, location: rt.location, facts: rt.facts });
+  if (requestsExecutionHold(packet)) {
+    job.continuation = { ...job.continuation, allowed: false, reason: "execution held by packet" };
+    job.progress.next_action = "Await explicit execution instruction.";
+  }
   writeJob(rt.location, job, { backup: true });
   appendEvent(rt.location, "mission-start", {
     job_id: job.job_id,
@@ -158,6 +166,18 @@ function seedMission(ctx: PiContext | PiToolContext, packet: string): { job?: Jo
 }
 
 export function registerStudio(pi: PiApi): void {
+  // The optional old command now feeds the same ordinary-packet runtime.
+  pi.registerCommand?.("studio", {
+    description: "Optional Studio packet or start shortcut; ordinary composer text is preferred",
+    async handler(args, ctx) {
+      const packet = args.trim();
+      if (!packet) {
+        ctx.ui.notify("Paste the task into the ordinary composer, or pass it after /studio.", "info");
+        return;
+      }
+      pi.sendUserMessage?.(packet.toLowerCase() === "start" ? "go ahead" : packet);
+    },
+  });
   pi.on("session_start", async (_event, ctx) => {
     const rt = runtimeFor(ctx);
     const job = jobOf(rt);

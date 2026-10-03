@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { compilePacket, detectControlIntent, isSubstantivePacket, looksLikeResumeAttempt, parseSections } from "../src/packet.js";
+import { requestsExecutionHold } from "../src/authority.js";
 
 const PACKET = `# DEMO
 ## OBJECTIVE
@@ -70,8 +71,19 @@ test("detectControlIntent reads ordinary language", () => {
   assert.equal(detectControlIntent("don't continue"), "pause");
   assert.equal(detectControlIntent("continue"), "resume");
   assert.equal(detectControlIntent("resume the mission"), "resume");
+  assert.equal(detectControlIntent("/studio start"), "resume");
+  assert.equal(detectControlIntent("go ahead"), "resume");
   assert.equal(detectControlIntent("rename foo to bar"), undefined);
   assert.equal(detectControlIntent("x".repeat(500)), undefined, "long prose is a packet, not a control word");
+});
+
+test("explicit packet holds are recognised without holding ordinary delivery", () => {
+  assert.equal(requestsExecutionHold("Plan only. Do not execute yet."), true);
+  assert.equal(requestsExecutionHold("Inspect only and wait for my approval."), true);
+  assert.equal(requestsExecutionHold("Don't execute until I approve."), true);
+  assert.equal(requestsExecutionHold("Implement, test, commit and push the fix."), false);
+  assert.equal(requestsExecutionHold("- Do not implement a second harness."), false);
+  assert.equal(requestsExecutionHold("Build a read-only API."), false);
 });
 
 test("resume attempts are recognised without assuming resolution", () => {

@@ -34,6 +34,8 @@ test("legacy missions retain the original rules rather than silently upgrading",
   const current = currentRuleSnapshot();
   assert.notEqual(legacy.digest, current.digest);
   assert.equal(legacy.entries.some((r) => r.key === "friction.absorb-noise"), false);
+  assert.equal(legacy.entries.some((r) => r.key === "scope.threadmoth-first"), false);
+  assert.equal(current.entries.some((r) => r.key === "scope.threadmoth-first"), true);
   assert.equal(legacy.entries.find((r) => r.key === "attention.human-only")?.revision, 1);
 });
 
