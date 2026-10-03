@@ -31,6 +31,21 @@ continued, evidence-checked mission.
 - **Lantern is contextual memory.** Never treat the `lantern-git` mirror as
   current repository truth, and do not couple Studio internals to Lantern's
   storage shape.
+- **CI spend is a budgeted resource.** CI proves what the project currently
+  ships, not hypothetical future platforms. On private repositories, default to
+  the smallest useful Linux CI. Do not add macOS or Windows hosted runners,
+  cross-platform matrices, packaging, release builds, scheduled/nightly jobs,
+  or other expensive hosted work unless the current mission explicitly requires
+  that platform or release path.
+- **Do not pay twice for one change.** Feature branches should normally be
+  validated by PR CI, with push CI reserved for the integration branch. Use
+  workflow concurrency with cancellation where newer commits supersede older
+  checks. Batch coherent work before pushing rather than using remote CI as an
+  edit/test loop.
+- **Prefer local platform evidence.** When Matthew's Windows machine can verify
+  Windows/desktop behaviour, use that local evidence during development. Hosted
+  platform packaging and release verification should be deliberate/manual until
+  the platform is an actual release target.
 
 ## Working rules
 
