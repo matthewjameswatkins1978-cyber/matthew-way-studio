@@ -107,8 +107,16 @@ export const MATTHEW_WAY_RULES: readonly RuleDefinition[] = [
     key: "scope.threadmoth-first",
     revision: 1,
     category: "scope",
-    status: "active",
+    status: "superseded",
     statement: "Use Threadmoth by default for supported file edits: preview, mutate, then verify the certificate. Fall back only when it genuinely cannot express the edit; explain why. Use ordinary tools for Git, builds, tests and read-only inspection.",
+  },
+  {
+    key: "scope.threadmoth-first",
+    revision: 2,
+    category: "scope",
+    status: "active",
+    supersedes: [1],
+    statement: "Before the first Threadmoth preview, establish the active checkout root and include an explicit budget.allowed_path_prefixes boundary for the intended workspace-relative target. Use a bridge only when its configured workspace root is established to match that checkout before preview; if it is rooted in a project mirror or another workspace, use the repository-local Threadmoth CLI from the active checkout root. Never widen or override the bridge root to make a request pass, and preserve refusals for paths outside the boundary. For supported edits, preview, inspect the result, mutate, and verify the certificate. Use ordinary tools for Git, builds, tests and read-only inspection; explain why before falling back when Threadmoth cannot express an edit.",
   },
   {
     ...LEGACY_ATTENTION_RULE,

@@ -108,7 +108,7 @@ export function startMission(input: {
       child_work: "",
       reconciliations: [],
     },
-    evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [] },
+    evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [], human_confirmed: [] },
     memory: { lantern: "not-needed", lantern_refs: [], decisions_loaded: [] },
     human_dogfood: { status: "none", checks: [] },
     continuation: { allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, last_signature: "", reason: "mission seeded" },
@@ -124,9 +124,16 @@ export interface CheckpointInput {
   next_action?: string;
   attempts?: number;
   child_work?: string;
+  /**
+   * Accepted for forward compatibility and IGNORED: no verified human-turn
+   * boundary exists in-process, so confirmations are never recorded and can
+   * never cover acceptance items. The tool layer refuses this input loudly.
+
+   */
+  human_confirmed?: number[];
   /** Small corrected assumption/crossed wire. Preserved without rewriting mission history. */
   reconciliation?: string;
-  checks?: { name: string; status: "pass" | "fail" | "skip"; detail?: string }[];
+  checks?: { name: string; status: "pass" | "fail" | "skip"; detail?: string; accepts?: number[] }[];
   commits?: string[];
   pushed_shas?: string[];
   artifacts?: string[];
@@ -142,7 +149,7 @@ function mergeChecks(existing: CheckEvidence[], incoming: CheckpointInput["check
   const byName = new Map(existing.map((c) => [c.name, c]));
   const at = new Date().toISOString();
   for (const check of incoming) {
-    byName.set(check.name, { name: check.name, status: check.status, detail: check.detail, at });
+    byName.set(check.name, { name: check.name, status: check.status, detail: check.detail, at, accepts: check.accepts });
   }
   // Keep the ledger compact: newest result per named check, capped.
   return [...byName.values()].slice(-40);
@@ -184,6 +191,7 @@ export function applyCheckpoint(job: JobState, input: CheckpointInput): JobState
       commits: uniqueCap(job.evidence.commits, input.commits, 60),
       pushed_shas: uniqueCap(job.evidence.pushed_shas, input.pushed_shas, 60),
       artifacts: uniqueCap(job.evidence.artifacts, input.artifacts, 40),
+      human_confirmed: job.evidence.human_confirmed,
     },
     memory: {
       lantern: input.lantern ?? job.memory.lantern,
@@ -207,6 +215,14 @@ export function applyCheckpoint(job: JobState, input: CheckpointInput): JobState
     next.continuation = { ...next.continuation, runs: 0, unchanged_streak: 0, error_streak: 0, allowed: true, reason: "resumed by checkpoint" };
     next.blocker = undefined;
     next.human_dogfood = job.human_dogfood.status === "pending" ? { status: "done", checks: job.human_dogfood.checks } : job.human_dogfood;
+    // Human confirmations are NEVER recorded: no observable human-turn
+    // boundary exists in-process. A checkpoint runs inside the agent turn,
+    // so NEEDS_HUMAN status alone cannot prove a human replied between the
+    // block and this call. Claimed confirmations are dropped, which keeps
+    // human-gated acceptance items uncovered and forces PARTIAL. (The input
+    // field is accepted for forward compatibility; the tool layer refuses it
+    // loudly so callers learn the boundary immediately.)
+    // (human_confirmed input intentionally unused — see above.)
   } else if (terminalStatus(job.status)) {
     // Recording evidence against a closed mission is allowed; reopening is not.
     next.continuation = { ...next.continuation, allowed: false };
@@ -254,7 +270,11 @@ export interface CompleteInput {
  * recorded evidence, or the outstanding items are explicitly human dogfood.
  * Deterministic: the model cannot narrate its way past an unverified push.
  */
-export function evaluateCompletion(job: JobState, input: CompleteInput): { ok: boolean; problems: string[]; reaffirm: boolean } {
+export function evaluateCompletion(
+  job: JobState,
+  input: CompleteInput,
+  opts: { dirty?: boolean } = {},
+): { ok: boolean; problems: string[]; reaffirm: boolean } {
   const problems: string[] = [];
   const reaffirm = terminalStatus(job.status) && job.status === input.outcome && job.result?.summary === input.summary.trim();
   if (terminalStatus(job.status) && !reaffirm) {
@@ -263,8 +283,49 @@ export function evaluateCompletion(job: JobState, input: CompleteInput): { ok: b
   }
   if (input.outcome === "COMPLETE") {
     if (job.evidence.checks.length === 0) problems.push("no machine evidence recorded (at least one check is required)");
-    if (!input.push_verified && !job.evidence.pushed_shas.length) problems.push("push not verified: record the pushed SHA or verify the remote");
-    if (!input.head_sha && !job.repo.current_sha) problems.push("no recorded revision for the completed work");
+    // Positive binding: every acceptance item needs a passing check that
+    // names its index. Agent-supplied dogfood citations never cover, and no
+    // in-process confirmation counts as a human check: a confirmation claim
+    // is not a human-check PASS. Items only a human can verify leave
+    // COMPLETE for PARTIAL (or NEEDS_HUMAN first).
+
+    if (job.acceptance.length > 0) {
+      const covered = new Set<number>();
+      for (const check of job.evidence.checks) {
+        if (check.status !== "pass") continue;
+        for (const index of check.accepts ?? []) covered.add(index);
+      }
+      // Human confirmations never cover acceptance items: none are recorded
+      // (see applyCheckpoint), so items only a human can verify stay
+      // uncovered and refuse COMPLETE for PARTIAL/NEEDS_HUMAN.
+      const missing = job.acceptance.map((_, i) => i + 1).filter((i) => !covered.has(i));
+      if (missing.length > 0) {
+        problems.push(
+          `acceptance items without passing evidence: ${missing.map((i) => `#${i} "${job.acceptance[i - 1]?.slice(0, 80) ?? ""}"`).join("; ")} — record checks with accepts:[n], close as PARTIAL/NEEDS_HUMAN when only a human can verify (no in-process confirmation is honored)`,
+        );
+      }
+    }
+    // Push binding: the final revision itself must be on the remote. A stale
+    // pushed_sha (or verify_push=false over stale evidence) can never pass.
+    const head = (input.head_sha?.trim() || job.repo.current_sha).toLowerCase();
+    if (!head) {
+      problems.push("no recorded revision for the completed work");
+    } else {
+      const recorded = job.evidence.pushed_shas.map((s) => s.toLowerCase());
+      const pushedInput = input.pushed_sha?.trim().toLowerCase() || "";
+      if (pushedInput && pushedInput !== head) {
+        problems.push(`pushed SHA ${input.pushed_sha?.trim().slice(0, 10)} does not match final revision ${head.slice(0, 10)}`);
+      }
+      if (input.push_verified === true) {
+        // A fresh remote check confirms the revision right now; the
+        // pushed-vs-head binding above already rules out stale SHAs.
+      } else if (input.push_verified === false) {
+        problems.push("remote re-check failed: the final revision is not confirmed on the remote — ship again or reconcile before COMPLETE");
+      } else if (!recorded.includes(head)) {
+        problems.push("push not verified: run studio_ship (which verifies) or re-check the remote SHA for the final revision");
+      }
+    }
+    if (opts.dirty) problems.push("worktree is dirty: commit or reconcile the unexpected changes before COMPLETE");
     const failed = job.evidence.checks.filter((c) => c.status === "fail");
     if (failed.length > 0) problems.push(`failing checks: ${failed.map((c) => `${c.name}(${c.detail ?? "no detail"})`).join(", ")}`);
   }
