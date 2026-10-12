@@ -112,7 +112,7 @@ const PACKET = [
   "- one file",
   "## ACCEPTANCE",
   "- status.json exists",
-  "- pushed to origin/main",
+  "- pushed to the mission branch on origin",
   "## ATTENTION",
   "- irreversible choices",
   "## IMPLEMENTATION ORDER",
@@ -125,6 +125,83 @@ const PACKET = [
 function boundaryEvent(entries: unknown[] = []): PiBoundaryEvent {
   return { type: "agent_before_settle", outcome: "completed", entries, continue: false, context: { canContinue: false } };
 }
+
+test("restart resumes the mission from the durable ledger", async () => {
+  const { dir } = tempRepo();
+  const first = makeHarness();
+  registerStudio(first.api);
+  const ctx = ctxFor(dir, first);
+  await emit(first, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  await first.tools.get("studio_checkpoint")!.execute("r1", { milestone: "M1", next_action: "write the file" }, undefined, undefined, ctx);
+  const before = readJob(ledgerLocation(dir));
+  assert.equal(before.kind, "loaded");
+  if (before.kind !== "loaded") return;
+  await emit(first, "session_shutdown", { type: "session_shutdown" }, ctx);
+  const kept = readJob(ledgerLocation(dir));
+  assert.equal(kept.kind === "loaded" && kept.job.status, "WORKING", "shutdown preserves an unfinished mission");
+  assert.equal(kept.kind === "loaded" && kept.job.job_id, before.job.job_id);
+
+  // A new process/session sees the same mission and says so out loud.
+  const second = makeHarness();
+  registerStudio(second.api);
+  await emit(second, "session_start", { type: "session_start" }, ctxFor(dir, second));
+  assert.ok(second.notifications.some((n) => n.includes("resuming mission")));
+  assert.ok(second.notifications.some((n) => n.includes("write the file")));
+});
+
+test("a corrupt ledger degrades with a warning and a fresh packet reseeds", async () => {
+  const { dir } = tempRepo();
+  const location = ledgerLocation(dir);
+  fs.mkdirSync(location.dir, { recursive: true });
+  fs.writeFileSync(path.join(location.dir, "active-job.json"), "%%%not-json%%%", "utf8");
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  await emit(harness, "session_start", { type: "session_start" }, ctx);
+  assert.ok(harness.notifications.some((n) => /corrupt/.test(n)), "corruption is announced, not silent");
+  await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  const reseeded = readJob(location);
+  assert.equal(reseeded.kind, "loaded");
+  if (reseeded.kind !== "loaded") return;
+  assert.equal(reseeded.job.status, "WORKING");
+});
+
+test("concurrent sessions append without losing events", async () => {
+  const { dir } = tempRepo();
+  const a = makeHarness();
+  registerStudio(a.api);
+  await emit(a, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctxFor(dir, a));
+  const b = makeHarness();
+  registerStudio(b.api);
+  await a.tools.get("studio_checkpoint")!.execute("c1", { checks: [{ name: "check-a", status: "pass" }] }, undefined, undefined, ctxFor(dir, a));
+  await b.tools.get("studio_checkpoint")!.execute("c2", { checks: [{ name: "check-b", status: "pass" }] }, undefined, undefined, ctxFor(dir, b));
+  const events = readEvents(ledgerLocation(dir), 50).filter((e) => e.type === "checkpoint");
+  assert.equal(events.length, 2, "both sessions recorded their checkpoint");
+  const job = readJob(ledgerLocation(dir));
+  assert.equal(job.kind, "loaded");
+  if (job.kind !== "loaded") return;
+  const names = job.job.evidence.checks.map((c) => c.name).sort();
+  assert.deepEqual(names, ["check-a", "check-b"], "last writer wins per check name, nothing silently dropped");
+});
+
+test("an unrelated small prompt neither duplicates nor disturbs the mission", async () => {
+  const { dir } = tempRepo();
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  const before = readJob(ledgerLocation(dir));
+  assert.equal(before.kind, "loaded");
+  if (before.kind !== "loaded") return;
+  const eventsBefore = readEvents(ledgerLocation(dir), 200).length;
+  const small: PiBeforeAgentStartEvent = { type: "before_agent_start", prompt: "thanks", systemPrompt: "", systemPromptOptions: {} };
+  await emit(harness, "before_agent_start", small, ctx);
+  const after = readJob(ledgerLocation(dir));
+  assert.equal(after.kind === "loaded" && after.job.job_id, before.job.job_id, "no duplicate mission");
+  assert.equal(after.kind === "loaded" && after.job.status, "WORKING");
+  assert.equal(readEvents(ledgerLocation(dir), 200).length, eventsBefore, "no mission events for small talk");
+  assert.match(small.systemPromptOptions.sections?.["studio_mission"] ?? "", /STUDIO/, "state stays understandable, not silent");
+});
 
 test("optional legacy command forwards into the ordinary packet path", async () => {
   const harness = makeHarness();
@@ -162,7 +239,7 @@ test("ordinary packet -> mission -> continuation, without a single command", asy
   const job = read.job;
   assert.equal(job.status, "WORKING");
   assert.match(job.objective, /status file/);
-  assert.deepEqual(job.acceptance, ["status.json exists", "pushed to origin/main"]);
+  assert.deepEqual(job.acceptance, ["status.json exists", "pushed to the mission branch on origin"]);
   assert.equal(job.progress.next_action, "Write status.json.");
   assert.match(job.rules.digest, /^sha256:[0-9a-f]{64}$/);
   assert.equal(job.rules.entries.some((r) => r.key === "friction.absorb-noise"), true);
@@ -328,11 +405,11 @@ test("a normal reply resumes the blocked mission and completion yields a receipt
   assert.equal(readJob(location).kind === "loaded" && (readJob(location) as any).job.status, "NEEDS_HUMAN", "a reply does not magically resolve the blocker");
 
   // Pi rechecks with its own tools and records the resolution.
+  execFileSync("git", ["checkout", "-b", "probe/smoke"], { cwd: dir });
   fs.writeFileSync(path.join(dir, "status.json"), `{"ok":true}\n`, "utf8");
-  execFileSync("git", ["add", "-A"], { cwd: dir });
-  execFileSync("git", ["commit", "-m", "feat: add status file"], { cwd: dir });
-  execFileSync("git", ["push", "origin", "main"], { cwd: dir });
-  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+  // Pushing straight to main is refused: missions ship on feature branches.
+  const mainPush = await harness.tools.get("studio_ship")!.execute("t4", { branch: "main" }, undefined, undefined, ctx);
+  assert.match(mainPush.content[0]?.text ?? "", /protected branch/);
 
   const resumed = await harness.tools.get("studio_checkpoint")!.execute("t3", { next_action: "verify push", checks: [{ name: "gh auth status", status: "pass" }] }, undefined, undefined, ctx);
   assert.match(resumed.content[0]?.text ?? "", /CHECKPOINT OK · WORKING/);
@@ -341,15 +418,29 @@ test("a normal reply resumes the blocked mission and completion yields a receipt
   if (afterResume.kind !== "loaded") return;
   assert.equal(afterResume.job.blocker, undefined);
 
-  // studio_ship verifies the real remote SHA.
-  const ship = await harness.tools.get("studio_ship")!.execute("t4", { dry_run: true }, undefined, undefined, ctx);
+  // studio_ship commits exactly the listed paths, pushes the mission branch and verifies the remote SHA.
+  const ship = await harness.tools.get("studio_ship")!.execute("t4b", { dry_run: true }, undefined, undefined, ctx);
   assert.match(ship.content[0]?.text ?? "", /DRY RUN · repo/);
-  const push = await harness.tools.get("studio_ship")!.execute("t5", { branch: "main" }, undefined, undefined, ctx);
+  const push = await harness.tools.get("studio_ship")!.execute(
+    "t5",
+    { commit: true, message: "feat: add status file", paths: ["status.json"], branch: "probe/smoke" },
+    undefined,
+    undefined,
+    ctx,
+  );
   assert.match(push.content[0]?.text ?? "", /PUSH: verified/);
+  assert.match(push.content[0]?.text ?? "", /staged: status\.json/);
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
   assert.match(push.content[0]?.text ?? "", new RegExp(head.slice(0, 12)));
 
-  await harness.tools.get("studio_checkpoint")!.execute("t6", { checks: [{ name: "git ls-remote origin main", status: "pass", detail: "matches HEAD" }] }, undefined, undefined, ctx);
-  const done = await harness.tools.get("studio_complete")!.execute("t7", { outcome: "COMPLETE", summary: "status file shipped and pushed", head_sha: head, branch: "main", pushed_sha: head, dogfood: ["Open the repo and confirm status.json"] }, undefined, undefined, ctx);
+  await harness.tools.get("studio_checkpoint")!.execute(
+    "t6",
+    { checks: [{ name: "node --check status.json", status: "pass", detail: "file parses", accepts: [1] }, { name: "git ls-remote origin probe/smoke", status: "pass", detail: "matches HEAD", accepts: [2] }] },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const done = await harness.tools.get("studio_complete")!.execute("t7", { outcome: "COMPLETE", summary: "status file shipped and pushed", head_sha: head, branch: "probe/smoke", pushed_sha: head, dogfood: ["Open the repo and confirm status.json"] }, undefined, undefined, ctx);
   const receipt = done.content[0]?.text ?? "";
   for (const label of ["RESULT: COMPLETE", "OBJECTIVE", "REPO", "BRANCH", "SHA", "PUSH", "MACHINE EVIDENCE", "IMPORTANT DECISIONS", "LANTERN", "HUMAN DOGFOOD", "UNRESOLVED", "HUMAN ATTENTION"]) {
     assert.match(receipt, new RegExp(`^${label}`, "m"), `receipt carries ${label}`);
@@ -443,13 +534,17 @@ test("a finished mission does not block the next packet", async () => {
   const location = ledgerLocation(dir);
 
   await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  execFileSync("git", ["checkout", "-b", "probe/first"], { cwd: dir });
   fs.writeFileSync(path.join(dir, "status.json"), `{"ok":true}\n`, "utf8");
   execFileSync("git", ["add", "-A"], { cwd: dir });
   execFileSync("git", ["commit", "-m", "feat: status file"], { cwd: dir });
   const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
-  await harness.tools.get("studio_checkpoint")!.execute("n1", { checks: [{ name: "npm test", status: "pass" }] }, undefined, undefined, ctx);
-  await harness.tools.get("studio_ship")!.execute("n2", { branch: "main" }, undefined, undefined, ctx);
-  await harness.tools.get("studio_complete")!.execute("n3", { outcome: "COMPLETE", summary: "first packet delivered", head_sha: head, branch: "main", pushed_sha: head }, undefined, undefined, ctx);
+  await harness.tools.get("studio_checkpoint")!.execute("n1", { checks: [{ name: "node --check status.json", status: "pass", accepts: [1] }] }, undefined, undefined, ctx);
+  const refusedMain = await harness.tools.get("studio_ship")!.execute("n2", { branch: "main" }, undefined, undefined, ctx);
+  assert.match(refusedMain.content[0]?.text ?? "", /protected branch/, "main is never a ship target");
+  await harness.tools.get("studio_ship")!.execute("n2b", { branch: "probe/first" }, undefined, undefined, ctx);
+  await harness.tools.get("studio_checkpoint")!.execute("n2c", { checks: [{ name: "git ls-remote origin probe/first", status: "pass", accepts: [2] }] }, undefined, undefined, ctx);
+  await harness.tools.get("studio_complete")!.execute("n3", { outcome: "COMPLETE", summary: "first packet delivered", head_sha: head, branch: "probe/first", pushed_sha: head }, undefined, undefined, ctx);
   assert.equal((readJob(location) as any).job.status, "COMPLETE");
 
   // A small follow-up keeps the closed mission closed.

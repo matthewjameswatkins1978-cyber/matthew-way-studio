@@ -84,6 +84,45 @@ function remoteUrl(root: string, name = "origin"): string {
   return r.ok ? r.stdout.trim() : "";
 }
 
+/**
+ * Branches Studio must never push to directly. Integration branches merge
+ * through Lucy; missions ship on isolated feature branches.
+ */
+export const PROTECTED_BRANCHES = [
+  "main",
+  "master",
+  "develop",
+  "development",
+  "trunk",
+  "foundation",
+  "release",
+] as const;
+
+const PROTECTED_PREFIXES = ["release/", "foundation/"] as const;
+
+export function isProtectedBranch(branch: string): boolean {
+  const name = branch.trim();
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  if ((PROTECTED_BRANCHES as readonly string[]).includes(lower)) return true;
+  return PROTECTED_PREFIXES.some((prefix) => lower.startsWith(prefix));
+}
+
+/** Repo-relative dirty paths from porcelain status (tracked and untracked). */
+export function liveDirtyPaths(root: string, cap = 200): string[] {
+  const status = run("git", ["status", "--porcelain=v1", "--untracked-files=normal"], root);
+  if (!status.ok) return [];
+  const paths: string[] = [];
+  for (const line of (status.stdout ?? "").split(/\r?\n/)) {
+    if (!line.trim() || paths.length >= cap) break;
+    const entry = line.slice(3);
+    // Rename/copy entries look like "old -> new": stage the new path.
+    const arrow = entry.indexOf(" -> ");
+    paths.push(arrow >= 0 ? entry.slice(arrow + 4) : entry);
+  }
+  return paths.filter(Boolean);
+}
+
 /** Short canonical "owner/repo" for receipts, from the origin URL when present. */
 export function canonicalRepo(remote: string): string {
   const ssh = /^git@[^:]+:(.+?)(?:\.git)?$/.exec(remote.trim());
@@ -139,6 +178,13 @@ export function pushAndVerify(root: string, branch: string, remoteName = "origin
   if (!head.ok) return { ok: false, detail: head.stderr.trim() || "no HEAD", local_sha: "" };
   const localSha = head.stdout.trim();
   if (!branch) return { ok: false, detail: "detached HEAD: refusing to guess a branch", local_sha: localSha };
+  if (isProtectedBranch(branch)) {
+    return {
+      ok: false,
+      detail: `refusing to push protected branch '${branch}': ship mission work on an isolated feature branch (Lucy merges integration branches)`,
+      local_sha: localSha,
+    };
+  }
   const push = run("git", ["push", "-u", remoteName, `HEAD:refs/heads/${branch}`], root, 120_000);
   const stderr = (push.stderr || push.stdout).trim();
   if (!push.ok) {
@@ -149,16 +195,31 @@ export function pushAndVerify(root: string, branch: string, remoteName = "origin
   return { ok: remote.verified, detail: remote.detail, local_sha: localSha, remote };
 }
 
-/** Checkpoint commit for work whose consequence warrants recoverability. */
-export function commitAll(root: string, message: string): { ok: boolean; sha: string; detail: string } {
-  const add = run("git", ["add", "-A"], root);
-  if (!add.ok) return { ok: false, sha: "", detail: add.stderr.trim() || "git add failed" };
+export interface CommitResult {
+  ok: boolean;
+  sha: string;
+  detail: string;
+  /** Exact pathspecs staged for this commit, in the order given. */
+  staged: string[];
+}
+
+/**
+ * Commit exactly the given repo-relative pathspecs — never a bare `git add -A`.
+ * Array argv (no shell) keeps hostile filenames inert. An empty selection is
+ * refused instead of silently committing everything or nothing.
+ */
+export function commitFiles(root: string, message: string, paths: string[]): CommitResult {
+  const clean = paths.map((p) => p.trim()).filter(Boolean);
+  if (!message.trim()) return { ok: false, sha: "", detail: "commit message is required", staged: [] };
+  if (!clean.length) return { ok: false, sha: "", detail: "no paths selected for commit", staged: [] };
+  const add = run("git", ["add", "--", ...clean], root);
+  if (!add.ok) return { ok: false, sha: "", detail: add.stderr.trim() || "git add failed", staged: [] };
   const status = run("git", ["status", "--porcelain=v1"], root);
-  if (!status.stdout.trim()) return { ok: true, sha: run("git", ["rev-parse", "HEAD"], root).stdout.trim(), detail: "nothing to commit" };
+  if (!status.stdout.trim()) return { ok: true, sha: run("git", ["rev-parse", "HEAD"], root).stdout.trim(), detail: "nothing to commit", staged: clean };
   const commit = run("git", ["commit", "-m", message], root, 60_000);
-  if (!commit.ok) return { ok: false, sha: "", detail: commit.stderr.trim().split(/\r?\n/)[0] || "commit failed" };
+  if (!commit.ok) return { ok: false, sha: "", detail: commit.stderr.trim().split(/\r?\n/)[0] || "commit failed", staged: clean };
   const sha = run("git", ["rev-parse", "HEAD"], root);
-  return { ok: true, sha: sha.stdout.trim(), detail: "committed" };
+  return { ok: true, sha: sha.stdout.trim(), detail: "committed", staged: clean };
 }
 
 /**

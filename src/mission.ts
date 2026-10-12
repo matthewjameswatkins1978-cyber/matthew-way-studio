@@ -126,7 +126,7 @@ export interface CheckpointInput {
   child_work?: string;
   /** Small corrected assumption/crossed wire. Preserved without rewriting mission history. */
   reconciliation?: string;
-  checks?: { name: string; status: "pass" | "fail" | "skip"; detail?: string }[];
+  checks?: { name: string; status: "pass" | "fail" | "skip"; detail?: string; accepts?: number[] }[];
   commits?: string[];
   pushed_shas?: string[];
   artifacts?: string[];
@@ -142,7 +142,7 @@ function mergeChecks(existing: CheckEvidence[], incoming: CheckpointInput["check
   const byName = new Map(existing.map((c) => [c.name, c]));
   const at = new Date().toISOString();
   for (const check of incoming) {
-    byName.set(check.name, { name: check.name, status: check.status, detail: check.detail, at });
+    byName.set(check.name, { name: check.name, status: check.status, detail: check.detail, at, accepts: check.accepts });
   }
   // Keep the ledger compact: newest result per named check, capped.
   return [...byName.values()].slice(-40);
@@ -254,7 +254,11 @@ export interface CompleteInput {
  * recorded evidence, or the outstanding items are explicitly human dogfood.
  * Deterministic: the model cannot narrate its way past an unverified push.
  */
-export function evaluateCompletion(job: JobState, input: CompleteInput): { ok: boolean; problems: string[]; reaffirm: boolean } {
+export function evaluateCompletion(
+  job: JobState,
+  input: CompleteInput,
+  opts: { dirty?: boolean } = {},
+): { ok: boolean; problems: string[]; reaffirm: boolean } {
   const problems: string[] = [];
   const reaffirm = terminalStatus(job.status) && job.status === input.outcome && job.result?.summary === input.summary.trim();
   if (terminalStatus(job.status) && !reaffirm) {
@@ -263,8 +267,53 @@ export function evaluateCompletion(job: JobState, input: CompleteInput): { ok: b
   }
   if (input.outcome === "COMPLETE") {
     if (job.evidence.checks.length === 0) problems.push("no machine evidence recorded (at least one check is required)");
-    if (!input.push_verified && !job.evidence.pushed_shas.length) problems.push("push not verified: record the pushed SHA or verify the remote");
-    if (!input.head_sha && !job.repo.current_sha) problems.push("no recorded revision for the completed work");
+    // Positive binding: every acceptance item needs a passing check that
+    // names its index, or an explicit human-dogfood citation (#n). Untagged
+    // evidence and uncited items can never complete a mission.
+    if (job.acceptance.length > 0) {
+      const covered = new Set<number>();
+      for (const check of job.evidence.checks) {
+        if (check.status !== "pass") continue;
+        for (const index of check.accepts ?? []) covered.add(index);
+      }
+      // Human dogfood is evidence too when it cites the item: Matthew is the
+      // independent observer for feel, visuals and click-throughs. Only
+      // in-range citations count; larger #numbers are external references.
+      const effectiveDogfood = input.dogfood?.length ? input.dogfood : job.human_dogfood.checks;
+      for (const entry of effectiveDogfood) {
+        for (const match of entry.matchAll(/#(\d+)/g)) {
+          const cited = parseInt(match[1] ?? "", 10);
+          if (cited >= 1 && cited <= job.acceptance.length) covered.add(cited);
+        }
+      }
+      const missing = job.acceptance.map((_, i) => i + 1).filter((i) => !covered.has(i));
+      if (missing.length > 0) {
+        problems.push(
+          `acceptance items without passing evidence: ${missing.map((i) => `#${i} "${job.acceptance[i - 1]?.slice(0, 80) ?? ""}"`).join("; ")} — record checks with accepts:[n] or cite the item in dogfood as #n`,
+        );
+      }
+    }
+    // Push binding: the final revision itself must be on the remote. A stale
+    // pushed_sha (or verify_push=false over stale evidence) can never pass.
+    const head = (input.head_sha?.trim() || job.repo.current_sha).toLowerCase();
+    if (!head) {
+      problems.push("no recorded revision for the completed work");
+    } else {
+      const recorded = job.evidence.pushed_shas.map((s) => s.toLowerCase());
+      const pushedInput = input.pushed_sha?.trim().toLowerCase() || "";
+      if (pushedInput && pushedInput !== head) {
+        problems.push(`pushed SHA ${input.pushed_sha?.trim().slice(0, 10)} does not match final revision ${head.slice(0, 10)}`);
+      }
+      if (input.push_verified === true) {
+        // A fresh remote check confirms the revision right now; the
+        // pushed-vs-head binding above already rules out stale SHAs.
+      } else if (input.push_verified === false) {
+        problems.push("remote re-check failed: the final revision is not confirmed on the remote — ship again or reconcile before COMPLETE");
+      } else if (!recorded.includes(head)) {
+        problems.push("push not verified: run studio_ship (which verifies) or re-check the remote SHA for the final revision");
+      }
+    }
+    if (opts.dirty) problems.push("worktree is dirty: commit or reconcile the unexpected changes before COMPLETE");
     const failed = job.evidence.checks.filter((c) => c.status === "fail");
     if (failed.length > 0) problems.push(`failing checks: ${failed.map((c) => `${c.name}(${c.detail ?? "no detail"})`).join(", ")}`);
   }

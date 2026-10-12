@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { commitAll, canonicalRepo, pushAndVerify, repoFacts, verifyRemoteSha } from "../src/git.js";
+import { commitFiles, canonicalRepo, isProtectedBranch, liveDirtyPaths, pushAndVerify, repoFacts, verifyRemoteSha } from "../src/git.js";
 import { gitCommonDir, ledgerLocation, repoRoot } from "../src/paths.js";
 
 function git(cwd: string, ...args: string[]): string {
@@ -112,7 +112,7 @@ gitTest("verifyRemoteSha distinguishes match, mismatch and unreachable", () => {
 gitTest("pushAndVerify commits, pushes and confirms the remote SHA", () => {
   const s = sandbox();
   fs.writeFileSync(path.join(s.worktree, "feature.ts"), "export const feature = true;\n", "utf8");
-  const commit = commitAll(s.worktree, "feat: add feature");
+  const commit = commitFiles(s.worktree, "feat: add feature", ["feature.ts"]);
   assert.equal(commit.ok, true);
   assert.match(commit.sha, /^[0-9a-f]{40}$/);
 
@@ -134,7 +134,7 @@ gitTest("pushAndVerify commits, pushes and confirms the remote SHA", () => {
 gitTest("push failure is reported as data, not thrown", () => {
   const s = sandbox();
   git(s.repo, "remote", "set-url", "origin", path.join(s.remote, "..", "missing.git"));
-  const res = pushAndVerify(s.repo, "main");
+  const res = pushAndVerify(s.worktree, "studio-task");
   assert.equal(res.ok, false);
   assert.match(res.detail, /push failed/);
   assert.match(res.local_sha, /^[0-9a-f]{40}$/);
@@ -148,11 +148,51 @@ test("canonicalRepo normalises ssh, https and .git forms", () => {
   assert.equal(canonicalRepo(""), "");
 });
 
-test("commitAll reports an already-clean tree without inventing a commit", () => {
+test("commitFiles reports an already-clean tree without inventing a commit", () => {
   const s = sandbox();
   const before = git(s.repo, "rev-parse", "HEAD");
-  const res = commitAll(s.repo, "chore: nothing");
+  const res = commitFiles(s.repo, "chore: nothing", ["README.md"]);
   assert.equal(res.ok, true);
   assert.equal(res.sha, before);
   assert.equal(res.detail, "nothing to commit");
+});
+
+gitTest("pushAndVerify refuses protected branches without touching the remote", () => {
+  const s = sandbox();
+  for (const branch of ["main", "Main", "master", "foundation", "release", "release/1.2", "foundation/next"]) {
+    assert.equal(isProtectedBranch(branch), true, branch);
+    const res = pushAndVerify(s.repo, branch);
+    assert.equal(res.ok, false);
+    assert.match(res.detail, /protected branch/);
+  }
+  for (const branch of ["feature/probe", "main2", "release-notes", "foundation-stone", "studio-task"]) {
+    assert.equal(isProtectedBranch(branch), false, branch);
+  }
+  // The refused pushes must not have created anything on the remote.
+  const refs = git(s.repo, "ls-remote", s.remote);
+  assert.ok(!refs.includes("refs/heads/release"), "no release ref may be created");
+  assert.ok(!refs.includes("refs/heads/foundation"), "no foundation ref may be created");
+});
+
+gitTest("commitFiles stages only the listed paths", () => {
+  const s = sandbox();
+  fs.writeFileSync(path.join(s.worktree, "a.ts"), "export const a = 1;\n", "utf8");
+  fs.writeFileSync(path.join(s.worktree, "b.ts"), "export const b = 2;\n", "utf8");
+  assert.deepEqual(liveDirtyPaths(s.worktree).sort(), ["a.ts", "b.ts"]);
+  const res = commitFiles(s.worktree, "feat: only a", ["a.ts"]);
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.staged, ["a.ts"]);
+  const show = git(s.worktree, "show", "--name-only", "--format=", "HEAD");
+  assert.ok(show.split(/\r?\n/).includes("a.ts"));
+  assert.ok(!show.split(/\r?\n/).includes("b.ts"), "unrelated file must stay out of the commit");
+  assert.ok(liveDirtyPaths(s.worktree).includes("b.ts"), "unrelated file must stay dirty");
+});
+
+gitTest("commitFiles refuses empty selections and hostile pathspecs stay inert", () => {
+  const s = sandbox();
+  const empty = commitFiles(s.worktree, "feat: nothing", []);
+  assert.equal(empty.ok, false);
+  assert.match(empty.detail, /no paths selected/);
+  const missing = commitFiles(s.worktree, "feat: ghost", ["no-such-file.ts"]);
+  assert.equal(missing.ok, false);
 });

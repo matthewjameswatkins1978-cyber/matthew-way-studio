@@ -49,6 +49,11 @@ export interface CheckEvidence {
   status: "pass" | "fail" | "skip";
   detail?: string;
   at: string;
+  /**
+   * 1-based acceptance items this check evidences. COMPLETE requires every
+   * acceptance item to be covered by at least one passing check.
+   */
+  accepts?: number[];
 }
 
 export interface JobContract {
@@ -178,6 +183,16 @@ function strList(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.length > 0) : [];
 }
 
+function clampAccepts(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: number[] = [];
+  for (const entry of value) {
+    if (typeof entry === "number" && Number.isInteger(entry) && entry >= 1 && !out.includes(entry)) out.push(entry);
+    if (out.length >= 32) break;
+  }
+  return out.length ? out : undefined;
+}
+
 function clampInt(value: unknown, min: number, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? Math.max(min, Math.trunc(value)) : fallback;
 }
@@ -268,6 +283,7 @@ export function normalizeJob(raw: unknown): JobState {
               status: coerceCheckStatus(c.status),
               detail: typeof c.detail === "string" ? c.detail : undefined,
               at: typeof c.at === "string" ? c.at : now,
+              accepts: clampAccepts(c.accepts),
             }))
         : [],
       commits: strList(evidence.commits),

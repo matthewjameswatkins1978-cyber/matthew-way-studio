@@ -173,16 +173,85 @@ test("resumeCandidate never assumes the blocker is gone", () => {
 
 test("COMPLETE requires machine evidence, a revision and push verification", () => {
   let job = startMission({ packet: PACKET, location: location(), facts: facts() });
+  assert.equal(job.acceptance.length, 2);
   const bare = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: "3".repeat(40), push_verified: false });
   assert.equal(bare.ok, false);
   assert.equal(bare.problems.length >= 2, true);
 
   job = applyCheckpoint(job, { checks: [{ name: "npm test", status: "pass" }], commits: ["3".repeat(40)] });
   const stillNoPush = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: "3".repeat(40), push_verified: false });
-  assert.ok(stillNoPush.problems.some((p) => /push not verified/.test(p)));
+  assert.ok(stillNoPush.problems.some((p) => /remote re-check failed/.test(p)));
 
-  const okGate = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: "3".repeat(40), push_verified: true });
+  const okGate = evaluateCompletion(
+    applyCheckpoint(job, { checks: [{ name: "npm test", status: "pass", accepts: [1, 2] }] }),
+    { outcome: "COMPLETE", summary: "done", head_sha: "3".repeat(40), push_verified: true },
+  );
   assert.equal(okGate.ok, true, okGate.problems.join(", "));
+});
+
+test("untagged evidence can never bind acceptance items", () => {
+  let job = startMission({ packet: PACKET, location: location(), facts: facts() });
+  job = applyCheckpoint(job, { checks: [{ name: "npm test", status: "pass" }] });
+  const gate = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: "3".repeat(40), push_verified: true });
+  assert.equal(gate.ok, false);
+  assert.ok(gate.problems.some((p) => /acceptance items without passing evidence: #1.*#2/.test(p)));
+});
+
+test("verify_push=false over stale evidence cannot complete", () => {
+  const head = "a".repeat(40);
+  const stale = "b".repeat(40);
+  let job = startMission({ packet: PACKET, location: location(), facts: facts() });
+  job = applyCheckpoint(job, {
+    checks: [{ name: "npm test", status: "pass", accepts: [1, 2] }],
+    pushed_shas: [stale],
+  });
+  // Stale pushed SHA presented explicitly: binding refuses.
+  const explicit = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: head, pushed_sha: stale, push_verified: false });
+  assert.equal(explicit.ok, false);
+  assert.ok(explicit.problems.some((p) => /does not match final revision/.test(p)));
+  // Stale recorded evidence with verification skipped: refused.
+  const skipped = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: head });
+  assert.equal(skipped.ok, false);
+  assert.ok(skipped.problems.some((p) => /push not verified/.test(p)));
+  // A failed fresh re-check blocks even with older ship evidence.
+  const moved = evaluateCompletion(
+    applyCheckpoint(job, { pushed_shas: [head] }),
+    { outcome: "COMPLETE", summary: "done", head_sha: head, push_verified: false },
+  );
+  assert.equal(moved.ok, false);
+  assert.ok(moved.problems.some((p) => /remote re-check failed/.test(p)));
+  // Ship-verified evidence for the final revision with verification skipped: allowed.
+  const recorded = applyCheckpoint(job, { pushed_shas: [head] });
+  const gate = evaluateCompletion(recorded, { outcome: "COMPLETE", summary: "done", head_sha: head });
+  assert.equal(gate.ok, true, gate.problems.join(", "));
+});
+
+test("dogfood citing #n covers human-verified acceptance items", () => {
+  const head = "d".repeat(40);
+  let job = startMission({ packet: PACKET, location: location(), facts: facts() });
+  job = applyCheckpoint(job, {
+    checks: [{ name: "npm test", status: "pass", accepts: [1] }],
+    pushed_shas: [head],
+  });
+  const cited = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: head, dogfood: ["#2 renders correctly in the GUI"] });
+  assert.equal(cited.ok, true, cited.problems.join(", "));
+  const uncited = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: head, dogfood: ["looks fine generally"] });
+  assert.equal(uncited.ok, false);
+  assert.ok(uncited.problems.some((p) => /acceptance items without passing evidence: #2/.test(p)));
+});
+
+test("a dirty worktree blocks COMPLETE but not PARTIAL", () => {
+  let job = startMission({ packet: PACKET, location: location(), facts: facts() });
+  job = applyCheckpoint(job, { checks: [{ name: "npm test", status: "pass", accepts: [1, 2] }], pushed_shas: ["c".repeat(40)] });
+  const dirty = evaluateCompletion(
+    job,
+    { outcome: "COMPLETE", summary: "done", head_sha: "c".repeat(40) },
+    { dirty: true },
+  );
+  assert.equal(dirty.ok, false);
+  assert.ok(dirty.problems.some((p) => /worktree is dirty/.test(p)));
+  const partial = evaluateCompletion(job, { outcome: "PARTIAL", summary: "dirty, handing over" }, { dirty: true });
+  assert.equal(partial.ok, true, partial.problems.join(", "));
 });
 
 test("a failing check refuses COMPLETE", () => {

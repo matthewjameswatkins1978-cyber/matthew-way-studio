@@ -10,6 +10,16 @@ import {
   validateRuleSet,
 } from "../src/rules.js";
 
+test("Threadmoth previews establish a checkout boundary and reject mirror-root mismatch", () => {
+  const statement = MATTHEW_WAY_RULES.find((r) => r.key === "scope.threadmoth-first" && r.status === "active")?.statement ?? "";
+  assert.match(statement, /Before the first Threadmoth preview/);
+  assert.match(statement, /budget\.allowed_path_prefixes/);
+  assert.match(statement, /outside the boundary/);
+  assert.match(statement, /configured workspace root is established to match that checkout/);
+  assert.match(statement, /project mirror or another workspace/);
+  assert.match(statement, /repository-local Threadmoth CLI from the active checkout root/);
+});
+
 test("current rules are deterministic and include the forgiving-friction law", () => {
   const a = currentRuleSnapshot();
   const b = currentRuleSnapshot();

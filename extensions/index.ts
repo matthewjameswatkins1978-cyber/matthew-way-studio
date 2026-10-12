@@ -23,7 +23,7 @@ import { ledgerLocation, type LedgerLocation } from "../src/paths.js";
 import { appendEvent, readJob, writeJob, readPacket, type JobReadResult } from "../src/ledger.js";
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
-import { commitAll, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
+import { commitFiles, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
 import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyMemory, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
 import { discoverLanternTools, lanternContextResult, readSnapshot } from "../src/lantern.js";
 import { isSubstantivePacket, detectControlIntent } from "../src/packet.js";
@@ -238,10 +238,16 @@ export function registerStudio(pi: PiApi): void {
       const warn = describeUnreadable(rt.read, rt.location.dir);
       if (warn) safeNotify(ctx, warn, "warning");
       if (!isSubstantivePacket(prompt) || prompt.trim().length < rt.config.minPacketChars) {
-        // Small jobs stay ordinary work, not heavyweight projects.
+        // Inaction must be legible: a long-but-small message gets an explicit
+        // idle note so the model never imagines a mission that was not seeded.
         if (job) {
           updateStatus(ctx, job, rt.config);
           withSection(event, missionSection(job, rt.config));
+        } else if (prompt.trim().length >= 150) {
+          withSection(
+            event,
+            `STUDIO: no mission started for this message (${prompt.trim().length} chars; a tracked mission needs mission headings and at least ${rt.config.minPacketChars} chars). Do the work directly with ordinary tools; nothing is recorded.`,
+          );
         }
         return undefined;
       }
@@ -373,7 +379,7 @@ export function registerStudio(pi: PiApi): void {
     name: "studio_checkpoint",
     label: "Studio checkpoint",
     description:
-      "Record mission progress: current milestone, next action, machine evidence, commits, pushed SHAs and Lantern usage. A checkpoint with a next action is what keeps autonomous continuation moving, and it clears a NEEDS_HUMAN block once the blocker is genuinely gone.",
+      "Record mission progress: current milestone, next action, machine evidence, commits, pushed SHAs and Lantern usage. Tag each check with accepts:[n] for the 1-based acceptance items it evidences (see studio_status) — COMPLETE requires every item covered by a passing check. A checkpoint with a next action is what keeps autonomous continuation moving, and it clears a NEEDS_HUMAN block once the blocker is genuinely gone.",
     promptSnippet: "Record progress/evidence for the active Studio mission and set the next action.",
     promptGuidelines: [
       "Call studio_checkpoint after each meaningful change in repo state, evidence, or next action.",
@@ -388,6 +394,9 @@ export function registerStudio(pi: PiApi): void {
             name: Type.String({ description: "Check identity, e.g. npm test" }),
             status: Type.String({ description: "pass | fail | skip" }),
             detail: Type.Optional(Type.String({ description: "Concise observed result" })),
+            accepts: Type.Optional(
+              Type.Array(Type.Integer({ minimum: 1 }), { description: "1-based acceptance items this check evidences (see studio_status)" }),
+            ),
           }),
           { description: "Machine checks actually run during this mission" },
         ),
@@ -546,7 +555,10 @@ export function registerStudio(pi: PiApi): void {
     parameters: Type.Object({
       commit: Type.Optional(Type.Boolean({ description: "Commit current changes before pushing (default false)" })),
       message: Type.Optional(Type.String({ description: "Commit message; required when commit=true" })),
-      branch: Type.Optional(Type.String({ description: "Branch to push (default: current mission branch)" })),
+      paths: Type.Optional(
+        Type.Array(Type.String(), { description: "Repo-relative paths to commit; default stages the live dirty set explicitly and records it. Unlisted files are never staged." }),
+      ),
+      branch: Type.Optional(Type.String({ description: "Branch to push (default: current mission branch). Protected branches (main, master, foundation, release, ...) are refused." })),
       remote: Type.Optional(Type.String({ description: "Remote name (default: origin)" })),
       dry_run: Type.Optional(Type.Boolean({ description: "Report facts only; change nothing" })),
     }),
@@ -574,13 +586,29 @@ export function registerStudio(pi: PiApi): void {
         );
       }
       if (!rt.facts.is_repo) return textResult("studio_ship needs a git repository. If one is genuinely missing, that is a human-only dependency: block with kind access.", undefined, true);
+      let staged: string[] = [];
       if (wantsCommit) {
         if (!message?.trim()) return textResult("commit=true requires a commit message.", undefined, true);
-        const commitRes = commitAll(root, message);
-        if (!commitRes.ok) return textResult(`commit failed: ${commitRes.detail}`, undefined, true);
+        const live = liveDirtyPaths(root);
+        const explicit = Array.isArray(params["paths"]) ? strArray(params["paths"]) : [];
+        const selected = explicit.length ? explicit : live;
+        if (!live.length) {
+          appendEvent(rt.location, "ship", { job_id: job?.job_id ?? "none", ok: true, detail: "nothing to commit", branch });
+        } else {
+          const commitRes = commitFiles(root, message, selected);
+          staged = commitRes.staged;
+          appendEvent(rt.location, "ship-commit", { job_id: job?.job_id ?? "none", ok: commitRes.ok, detail: commitRes.detail, staged });
+          if (!commitRes.ok) return textResult(`commit failed: ${commitRes.detail}`, undefined, true);
+        }
+        if (job?.repo.dirty_at_start) {
+          appendEvent(rt.location, "ship-dirty-start", { job_id: job?.job_id ?? "none", note: "repo was dirty when the mission started; staged list recorded for review" });
+        }
       }
       const push = pushAndVerify(root, branch, remoteName);
       const facts = repoFacts(root);
+      // A ship without a mission is a plain git helper: say so loudly so the
+      // model never mistakes it for tracked mission progress.
+      const joblessNote = !job ? "STUDIO: no active mission — plain git helper; nothing was recorded to a ledger. " : "";
       if (job) {
         const updated = applyCheckpoint(job, {
           head_sha: facts.head_sha || push.local_sha,
@@ -592,12 +620,12 @@ export function registerStudio(pi: PiApi): void {
         appendEvent(rt.location, "ship", { job_id: job.job_id, ok: push.ok, detail: push.detail, branch, sha: push.local_sha });
       }
       const lines = [
-        `PUSH: ${push.ok ? "verified" : "not verified"}`,
+        `${joblessNote}PUSH: ${push.ok ? "verified" : "not verified"}`,
         `branch: ${branch || "(detached)"}`,
         `local SHA: ${push.local_sha}`,
         push.remote?.remote_sha ? `remote SHA: ${push.remote.remote_sha}` : "remote SHA: unknown",
         `detail: ${push.detail}`,
-        wantsCommit ? "commit: created" : "commit: none requested",
+        wantsCommit ? (staged.length ? `commit: created (staged: ${staged.join(", ")})` : "commit: nothing to commit") : "commit: none requested",
       ];
       if (!push.ok && /credential|auth|403|permission|token|denied/i.test(push.detail)) {
         lines.push("", "This looks like an access problem only Matthew can resolve: consider studio_blocked with kind authentication or access.");
@@ -611,7 +639,7 @@ export function registerStudio(pi: PiApi): void {
     name: "studio_complete",
     label: "Studio complete",
     description:
-      "Close the mission as COMPLETE, PARTIAL or FAILED and produce the concise evidence receipt for Lucy/ChatGPT review. COMPLETE is refused while machine evidence is missing, a recorded check is failing, or the push is unverified — unless the only outstanding item is declared human dogfood.",
+      "Close the mission as COMPLETE, PARTIAL or FAILED and produce the concise evidence receipt for Lucy/ChatGPT review. COMPLETE is refused while acceptance items lack passing checks tagged with accepts:[n], a recorded check is failing, the worktree is dirty, or the final revision is not confirmed on the remote — unless the only outstanding item is declared human dogfood.",
     promptSnippet: "Finish the mission and emit the concise evidence receipt.",
     promptGuidelines: [
       "Call studio_complete only when the mission's acceptance is materially satisfied or the remainder is explicit human dogfood.",
@@ -624,7 +652,7 @@ export function registerStudio(pi: PiApi): void {
       branch: Type.Optional(Type.String()),
       pushed_sha: Type.Optional(Type.String({ description: "SHA pushed to the remote" })),
       verify_push: Type.Optional(Type.Boolean({ description: "Re-check the remote SHA now (default true for COMPLETE)" })),
-      dogfood: Type.Optional(Type.Array(Type.String({ description: "Short human checks, one step each" }))),
+      dogfood: Type.Optional(Type.Array(Type.String({ description: "Short human checks, one step each; cite the acceptance item as #n when a human verifies it" }))),
     }),
     execute: async (_id, params, _signal, _update, ctx) => {
       const rt = runtimeFor(ctx);
@@ -650,7 +678,7 @@ export function registerStudio(pi: PiApi): void {
         repo: { ...job.repo, current_sha: head || job.repo.current_sha },
         evidence: { ...job.evidence, pushed_shas: pushVerified === true && (pushed || head) ? [...new Set([...job.evidence.pushed_shas, pushed || head])] : job.evidence.pushed_shas },
       };
-      const gate = evaluateCompletion(candidate, { outcome, summary, head_sha: head, branch, pushed_sha: pushed, push_verified: pushVerified, dogfood });
+      const gate = evaluateCompletion(candidate, { outcome, summary, head_sha: head, branch, pushed_sha: pushed, push_verified: pushVerified, dogfood }, { dirty: rt.facts.dirty });
       if (gate.reaffirm) {
         return textResult(`${job.result?.receipt ?? renderReceipt(candidate, rt.facts, { push_verified: pushVerified })}\n\nAlready recorded as ${job.status}; nothing was re-declared.`, {
           job_id: job.job_id,
@@ -856,16 +884,19 @@ function strArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string" && v.trim().length > 0) : [];
 }
 
-function parseChecks(value: unknown): { name: string; status: "pass" | "fail" | "skip"; detail?: string }[] | undefined {
+function parseChecks(value: unknown): { name: string; status: "pass" | "fail" | "skip"; detail?: string; accepts?: number[] }[] | undefined {
   if (!Array.isArray(value)) return undefined;
-  const out: { name: string; status: "pass" | "fail" | "skip"; detail?: string }[] = [];
+  const out: { name: string; status: "pass" | "fail" | "skip"; detail?: string; accepts?: number[] }[] = [];
   for (const item of value) {
     const rec = item as Record<string, unknown>;
     const name = typeof rec?.name === "string" ? rec.name : "";
     if (!name) continue;
     const raw = String(rec.status ?? "pass").toLowerCase();
     const status: "pass" | "fail" | "skip" = raw.startsWith("f") ? "fail" : raw.startsWith("s") ? "skip" : "pass";
-    out.push({ name, status, detail: typeof rec.detail === "string" ? rec.detail : undefined });
+    const accepts = Array.isArray(rec.accepts)
+      ? [...new Set(rec.accepts.filter((n): n is number => typeof n === "number" && Number.isInteger(n) && n >= 1))].slice(0, 32)
+      : undefined;
+    out.push({ name, status, detail: typeof rec.detail === "string" ? rec.detail : undefined, accepts });
   }
   return out.length ? out : undefined;
 }
