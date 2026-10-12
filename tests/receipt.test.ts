@@ -48,6 +48,7 @@ test("receipt carries exactly the fields Lucy needs, in order", () => {
       commits: ["b".repeat(40)],
       pushed_shas: ["b".repeat(40)],
       artifacts: ["extensions/index.ts"],
+      human_confirmed: [],
     },
     memory: { lantern: "used", lantern_refs: ["mem-42"], decisions_loaded: ["state lives in git common dir"] },
   });
@@ -82,7 +83,7 @@ test("human dogfood renders as one short numbered check", () => {
   const j = job({
     status: "COMPLETE",
     result: { outcome: "COMPLETE", summary: "gui tweak" },
-    evidence: { checks: [{ name: "npm test", status: "pass", at: "now" }], commits: [], pushed_shas: ["z"], artifacts: [] },
+    evidence: { checks: [{ name: "npm test", status: "pass", at: "now" }], commits: [], pushed_shas: ["z"], artifacts: [], human_confirmed: [] },
     human_dogfood: { status: "pending", checks: ["Open Pi", "Paste a packet", "Tell Lucy/Pi whether it ran"] },
   });
   const text = renderReceipt(j, facts);
@@ -103,7 +104,7 @@ test("NEEDS_HUMAN block states the one need, why, and no commands for Matthew", 
       times_raised: 1,
     },
     progress: { milestone: "M3", next_action: "push and verify SHA", attempts: 2, child_work: "", reconciliations: [] },
-    evidence: { checks: [{ name: "npm test", status: "pass", at: "now" }], commits: ["b".repeat(40)], pushed_shas: [], artifacts: [] },
+    evidence: { checks: [{ name: "npm test", status: "pass", at: "now" }], commits: ["b".repeat(40)], pushed_shas: [], artifacts: [], human_confirmed: [] },
   });
   const text = renderNeedsHuman(blocked, facts, {
     exact_human_need: "run gh auth login once on this machine",

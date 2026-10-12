@@ -108,7 +108,7 @@ export function startMission(input: {
       child_work: "",
       reconciliations: [],
     },
-    evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [] },
+    evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [], human_confirmed: [] },
     memory: { lantern: "not-needed", lantern_refs: [], decisions_loaded: [] },
     human_dogfood: { status: "none", checks: [] },
     continuation: { allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, last_signature: "", reason: "mission seeded" },
@@ -124,6 +124,12 @@ export interface CheckpointInput {
   next_action?: string;
   attempts?: number;
   child_work?: string;
+  /**
+   * 1-based acceptance items the human explicitly confirmed. Honored ONLY
+   * when this checkpoint performs the NEEDS_HUMAN resume edge; otherwise
+   * ignored (the tool layer refuses it outright).
+   */
+  human_confirmed?: number[];
   /** Small corrected assumption/crossed wire. Preserved without rewriting mission history. */
   reconciliation?: string;
   checks?: { name: string; status: "pass" | "fail" | "skip"; detail?: string; accepts?: number[] }[];
@@ -184,6 +190,7 @@ export function applyCheckpoint(job: JobState, input: CheckpointInput): JobState
       commits: uniqueCap(job.evidence.commits, input.commits, 60),
       pushed_shas: uniqueCap(job.evidence.pushed_shas, input.pushed_shas, 60),
       artifacts: uniqueCap(job.evidence.artifacts, input.artifacts, 40),
+      human_confirmed: job.evidence.human_confirmed,
     },
     memory: {
       lantern: input.lantern ?? job.memory.lantern,
@@ -207,6 +214,16 @@ export function applyCheckpoint(job: JobState, input: CheckpointInput): JobState
     next.continuation = { ...next.continuation, runs: 0, unchanged_streak: 0, error_streak: 0, allowed: true, reason: "resumed by checkpoint" };
     next.blocker = undefined;
     next.human_dogfood = job.human_dogfood.status === "pending" ? { status: "done", checks: job.human_dogfood.checks } : job.human_dogfood;
+    // Human confirmations land here and only here: the resume edge
+    // structurally follows a human turn, so a claimed confirmation cannot
+    // be manufactured mid-flight without passing through NEEDS_HUMAN first.
+    if (input.human_confirmed?.length) {
+      const valid = input.human_confirmed.filter((n) => Number.isInteger(n) && n >= 1 && n <= job.acceptance.length);
+      next.evidence = {
+        ...next.evidence,
+        human_confirmed: [...new Set([...next.evidence.human_confirmed, ...valid])].slice(0, 32),
+      };
+    }
   } else if (terminalStatus(job.status)) {
     // Recording evidence against a closed mission is allowed; reopening is not.
     next.continuation = { ...next.continuation, allowed: false };
@@ -268,28 +285,23 @@ export function evaluateCompletion(
   if (input.outcome === "COMPLETE") {
     if (job.evidence.checks.length === 0) problems.push("no machine evidence recorded (at least one check is required)");
     // Positive binding: every acceptance item needs a passing check that
-    // names its index, or an explicit human-dogfood citation (#n). Untagged
-    // evidence and uncited items can never complete a mission.
+    // names its index, or an explicit human confirmation recorded on the
+    // NEEDS_HUMAN resume edge. Agent-supplied dogfood citations never cover:
+    // a request for a human check is not a human-check PASS. Uncovered and
+    // unconfirmed items leave COMPLETE for PARTIAL (or NEEDS_HUMAN first).
     if (job.acceptance.length > 0) {
       const covered = new Set<number>();
       for (const check of job.evidence.checks) {
         if (check.status !== "pass") continue;
         for (const index of check.accepts ?? []) covered.add(index);
       }
-      // Human dogfood is evidence too when it cites the item: Matthew is the
-      // independent observer for feel, visuals and click-throughs. Only
-      // in-range citations count; larger #numbers are external references.
-      const effectiveDogfood = input.dogfood?.length ? input.dogfood : job.human_dogfood.checks;
-      for (const entry of effectiveDogfood) {
-        for (const match of entry.matchAll(/#(\d+)/g)) {
-          const cited = parseInt(match[1] ?? "", 10);
-          if (cited >= 1 && cited <= job.acceptance.length) covered.add(cited);
-        }
+      for (const confirmed of job.evidence.human_confirmed) {
+        if (confirmed >= 1 && confirmed <= job.acceptance.length) covered.add(confirmed);
       }
       const missing = job.acceptance.map((_, i) => i + 1).filter((i) => !covered.has(i));
       if (missing.length > 0) {
         problems.push(
-          `acceptance items without passing evidence: ${missing.map((i) => `#${i} "${job.acceptance[i - 1]?.slice(0, 80) ?? ""}"`).join("; ")} — record checks with accepts:[n] or cite the item in dogfood as #n`,
+          `acceptance items without passing evidence: ${missing.map((i) => `#${i} "${job.acceptance[i - 1]?.slice(0, 80) ?? ""}"`).join("; ")} — record checks with accepts:[n], confirm via checkpoint human_confirmed on the NEEDS_HUMAN resume edge, or close as PARTIAL`,
         );
       }
     }

@@ -93,6 +93,12 @@ export interface JobEvidence {
   commits: string[];
   pushed_shas: string[];
   artifacts: string[];
+  /**
+   * 1-based acceptance items a human explicitly confirmed. Recorded ONLY on
+   * the NEEDS_HUMAN resume edge (after a real human turn), never claimed
+   * mid-flight: agent-supplied assertions without that provenance are refused.
+   */
+  human_confirmed: number[];
 }
 
 export interface JobMemory {
@@ -289,6 +295,9 @@ export function normalizeJob(raw: unknown): JobState {
       commits: strList(evidence.commits),
       pushed_shas: strList(evidence.pushed_shas),
       artifacts: strList(evidence.artifacts),
+      human_confirmed: Array.isArray(evidence.human_confirmed)
+        ? evidence.human_confirmed.filter((n): n is number => typeof n === "number" && Number.isInteger(n) && n >= 1).slice(0, 32)
+        : [],
     },
     memory: {
       lantern: lanternMemory === "used" || lanternMemory === "unavailable" ? (lanternMemory as JobMemory["lantern"]) : "not-needed",
@@ -358,7 +367,7 @@ export function newJob(input: {
     ...input.contract,
     repo: input.repo,
     progress: { milestone: "", next_action: input.nextAction, attempts: 0, child_work: "", reconciliations: [] },
-    evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [] },
+    evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [], human_confirmed: [] },
     memory: { lantern: "not-needed", lantern_refs: [], decisions_loaded: [] },
     human_dogfood: { status: "none", checks: [] },
     continuation: {

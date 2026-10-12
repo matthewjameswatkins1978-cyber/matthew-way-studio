@@ -16,6 +16,12 @@ export interface StudioConfig extends ContinuationLimits {
   lanternMirror?: SnapshotConfig;
   /** Do not register anything or touch state when the folder is untrusted. */
   requireProjectTrust: boolean;
+  /**
+   * Exact extra branch names the mission must never push to directly
+   * (built-ins already cover main/master/foundation/bootstrap/release).
+   * Declare repo integration targets here.
+   */
+  protectedBranches?: string[];
 }
 
 export const DEFAULT_CONFIG: StudioConfig = {
@@ -56,6 +62,9 @@ export function mergeConfig(base: StudioConfig, raw: Partial<StudioConfig>): Stu
     minPacketChars: positiveInt(raw.minPacketChars, base.minPacketChars),
     autoContinue: typeof raw.autoContinue === "boolean" ? raw.autoContinue : base.autoContinue,
     requireProjectTrust: typeof raw.requireProjectTrust === "boolean" ? raw.requireProjectTrust : base.requireProjectTrust,
+    protectedBranches: Array.isArray(raw.protectedBranches)
+      ? raw.protectedBranches.filter((b): b is string => typeof b === "string" && b.trim().length > 0).slice(0, 32)
+      : base.protectedBranches,
     lanternMirror: raw.lanternMirror?.mirrorPath ? { mirrorPath: raw.lanternMirror.mirrorPath, maxAgeMinutes: raw.lanternMirror.maxAgeMinutes } : base.lanternMirror,
   };
 }

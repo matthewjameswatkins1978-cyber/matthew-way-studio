@@ -23,7 +23,7 @@ import { ledgerLocation, type LedgerLocation } from "../src/paths.js";
 import { appendEvent, readJob, writeJob, readPacket, type JobReadResult } from "../src/ledger.js";
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
-import { commitFiles, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
+import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
 import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyMemory, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
 import { discoverLanternTools, lanternContextResult, readSnapshot } from "../src/lantern.js";
 import { isSubstantivePacket, detectControlIntent } from "../src/packet.js";
@@ -408,6 +408,9 @@ export function registerStudio(pi: PiApi): void {
       branch: Type.Optional(Type.String()),
       attempts: Type.Optional(Type.Number({ description: "Explicit attempt count for the current approach" })),
       child_work: Type.Optional(Type.String({ description: "What any delegated worker is doing, or 'none'" })),
+      human_confirmed: Type.Optional(
+        Type.Array(Type.Integer({ minimum: 1 }), { description: "1-based acceptance items the human explicitly confirmed. Honored ONLY on the NEEDS_HUMAN resume edge; refused anywhere else." }),
+      ),
       reconciliation: Type.Optional(Type.String({ description: "Small corrected assumption/crossed wire; preserves history and continues the same mission" })),
       lantern: Type.Optional(Type.String({ description: "used | not-needed | unavailable" })),
       lantern_refs: Type.Optional(Type.Array(Type.String({ description: "Lantern handles/ids referenced" }))),
@@ -420,10 +423,21 @@ export function registerStudio(pi: PiApi): void {
         return textResult("No active Studio mission. Small jobs do not need one: just do the work. A substantial packet starts a mission automatically.", undefined, true);
       }
       const checks = parseChecks(params["checks"]);
+      const humanConfirmed = Array.isArray(params["human_confirmed"])
+        ? [...new Set(params["human_confirmed"].filter((n): n is number => typeof n === "number" && Number.isInteger(n) && n >= 1))].slice(0, 32)
+        : [];
+      if (humanConfirmed.length && job.status !== "NEEDS_HUMAN") {
+        return textResult(
+          "human_confirmed only counts on the NEEDS_HUMAN resume edge: confirmations without a preceding human turn are refused. If GUI verification is still outstanding, block with studio_blocked or close as PARTIAL.",
+          undefined,
+          true,
+        );
+      }
       const updated = applyCheckpoint(job, {
         milestone: str(params["milestone"]),
         next_action: str(params["next_action"]),
         checks,
+        human_confirmed: humanConfirmed.length ? humanConfirmed : undefined,
         commits: strArray(params["commits"]),
         pushed_shas: strArray(params["pushed_shas"]),
         artifacts: strArray(params["artifacts"]),
@@ -556,7 +570,7 @@ export function registerStudio(pi: PiApi): void {
       commit: Type.Optional(Type.Boolean({ description: "Commit current changes before pushing (default false)" })),
       message: Type.Optional(Type.String({ description: "Commit message; required when commit=true" })),
       paths: Type.Optional(
-        Type.Array(Type.String(), { description: "Repo-relative paths to commit; default stages the live dirty set explicitly and records it. Unlisted files are never staged." }),
+        Type.Array(Type.String(), { description: "REQUIRED when commit=true: exact repo-relative paths to commit. Unlisted files are never staged. Omit commit to push only." }),
       ),
       branch: Type.Optional(Type.String({ description: "Branch to push (default: current mission branch). Protected branches (main, master, foundation, release, ...) are refused." })),
       remote: Type.Optional(Type.String({ description: "Remote name (default: origin)" })),
@@ -586,25 +600,44 @@ export function registerStudio(pi: PiApi): void {
         );
       }
       if (!rt.facts.is_repo) return textResult("studio_ship needs a git repository. If one is genuinely missing, that is a human-only dependency: block with kind access.", undefined, true);
+      // Destination gates run before ANY write: forbidden branches, and
+      // pushing HEAD to a ref other than the checkout, are refused up front.
+      if (!branch) return textResult("detached HEAD: check out the mission branch before shipping.", undefined, true);
+      if (isProtectedBranch(branch, rt.config.protectedBranches)) {
+        return textResult(`refusing to ship protected branch '${branch}': use an isolated feature branch (Lucy merges integration branches).`, undefined, true);
+      }
+      if (rt.facts.branch && rt.facts.branch !== branch) {
+        return textResult(`refusing to push HEAD (${rt.facts.branch}) to a different ref '${branch}': check out the target branch first.`, undefined, true);
+      }
       let staged: string[] = [];
+      let committed: string[] = [];
       if (wantsCommit) {
         if (!message?.trim()) return textResult("commit=true requires a commit message.", undefined, true);
-        const live = liveDirtyPaths(root);
-        const explicit = Array.isArray(params["paths"]) ? strArray(params["paths"]) : [];
-        const selected = explicit.length ? explicit : live;
-        if (!live.length) {
-          appendEvent(rt.location, "ship", { job_id: job?.job_id ?? "none", ok: true, detail: "nothing to commit", branch });
-        } else {
-          const commitRes = commitFiles(root, message, selected);
-          staged = commitRes.staged;
-          appendEvent(rt.location, "ship-commit", { job_id: job?.job_id ?? "none", ok: commitRes.ok, detail: commitRes.detail, staged });
-          if (!commitRes.ok) return textResult(`commit failed: ${commitRes.detail}`, undefined, true);
+        // Explicit scope is required: defaulting to the whole dirty set
+        // stages unrelated files indiscriminately, so fail closed instead.
+        const explicit = strArray(params["paths"]);
+        if (!explicit.length) {
+          const live = liveDirtyPaths(root);
+          return textResult(
+            [
+              "commit=true requires explicit paths: refusing to stage the whole dirty set.",
+              live.length ? `Live dirty set: ${live.join(", ")}` : "Worktree is clean — nothing to commit.",
+              "Pass the mission-owned files as paths and call studio_ship again.",
+            ].join("\n"),
+            undefined,
+            true,
+          );
         }
+        const commitRes = commitFiles(root, message, explicit);
+        staged = commitRes.staged;
+        committed = commitRes.committed;
+        appendEvent(rt.location, "ship-commit", { job_id: job?.job_id ?? "none", ok: commitRes.ok, detail: commitRes.detail, staged, committed });
+        if (!commitRes.ok) return textResult(`commit failed: ${commitRes.detail}`, undefined, true);
         if (job?.repo.dirty_at_start) {
           appendEvent(rt.location, "ship-dirty-start", { job_id: job?.job_id ?? "none", note: "repo was dirty when the mission started; staged list recorded for review" });
         }
       }
-      const push = pushAndVerify(root, branch, remoteName);
+      const push = pushAndVerify(root, branch, remoteName, { protectedBranches: rt.config.protectedBranches });
       const facts = repoFacts(root);
       // A ship without a mission is a plain git helper: say so loudly so the
       // model never mistakes it for tracked mission progress.
@@ -625,7 +658,7 @@ export function registerStudio(pi: PiApi): void {
         `local SHA: ${push.local_sha}`,
         push.remote?.remote_sha ? `remote SHA: ${push.remote.remote_sha}` : "remote SHA: unknown",
         `detail: ${push.detail}`,
-        wantsCommit ? (staged.length ? `commit: created (staged: ${staged.join(", ")})` : "commit: nothing to commit") : "commit: none requested",
+        wantsCommit ? (staged.length ? `commit: created (staged: ${staged.join(", ")}; actual: ${committed.join(", ") || "none"})` : "commit: nothing to commit") : "commit: none requested",
       ];
       if (!push.ok && /credential|auth|403|permission|token|denied/i.test(push.detail)) {
         lines.push("", "This looks like an access problem only Matthew can resolve: consider studio_blocked with kind authentication or access.");
@@ -639,7 +672,7 @@ export function registerStudio(pi: PiApi): void {
     name: "studio_complete",
     label: "Studio complete",
     description:
-      "Close the mission as COMPLETE, PARTIAL or FAILED and produce the concise evidence receipt for Lucy/ChatGPT review. COMPLETE is refused while acceptance items lack passing checks tagged with accepts:[n], a recorded check is failing, the worktree is dirty, or the final revision is not confirmed on the remote — unless the only outstanding item is declared human dogfood.",
+      "Close the mission as COMPLETE, PARTIAL or FAILED and produce the concise evidence receipt for Lucy/ChatGPT review. Supplied branch/head_sha must equal the live checkout. COMPLETE is refused while acceptance items lack passing checks tagged with accepts:[n] (human-verified items count only via checkpoint human_confirmed on the NEEDS_HUMAN resume edge — dogfood requests never cover), a recorded check is failing, the worktree is dirty, or the final revision is not confirmed on the remote.",
     promptSnippet: "Finish the mission and emit the concise evidence receipt.",
     promptGuidelines: [
       "Call studio_complete only when the mission's acceptance is materially satisfied or the remainder is explicit human dogfood.",
@@ -652,7 +685,7 @@ export function registerStudio(pi: PiApi): void {
       branch: Type.Optional(Type.String()),
       pushed_sha: Type.Optional(Type.String({ description: "SHA pushed to the remote" })),
       verify_push: Type.Optional(Type.Boolean({ description: "Re-check the remote SHA now (default true for COMPLETE)" })),
-      dogfood: Type.Optional(Type.Array(Type.String({ description: "Short human checks, one step each; cite the acceptance item as #n when a human verifies it" }))),
+      dogfood: Type.Optional(Type.Array(Type.String({ description: "Short human checks, one step each. A dogfood request never counts as evidence; outstanding GUI items leave COMPLETE for PARTIAL until a human confirms via the NEEDS_HUMAN resume edge." }))),
     }),
     execute: async (_id, params, _signal, _update, ctx) => {
       const rt = runtimeFor(ctx);
@@ -660,8 +693,18 @@ export function registerStudio(pi: PiApi): void {
       if (!job) return textResult("No active Studio mission to complete.", undefined, true);
       const outcome = normalizeOutcome(str(params["outcome"]));
       const summary = str(params["summary"]) ?? "";
-      const branch = str(params["branch"]) || job.repo.branch || rt.facts.branch;
-      const head = str(params["head_sha"]) || rt.facts.head_sha || job.repo.current_sha;
+      const branchParam = str(params["branch"]);
+      const headParam = str(params["head_sha"]);
+      const branch = branchParam || job.repo.branch || rt.facts.branch;
+      const head = headParam || rt.facts.head_sha || job.repo.current_sha;
+      // Bind to live git identity observed just now: caller-supplied branch
+      // or revision must equal the checkout, never a fabricated value.
+      if (branchParam && rt.facts.branch && branchParam !== rt.facts.branch) {
+        return textResult(`branch '${branchParam}' does not match the live checkout '${rt.facts.branch}': re-observe before completing.`, undefined, true);
+      }
+      if (headParam && rt.facts.head_sha && headParam.toLowerCase() !== rt.facts.head_sha.toLowerCase()) {
+        return textResult(`head_sha ${headParam.slice(0, 10)} does not match live HEAD ${rt.facts.head_sha.slice(0, 10)}: re-observe before completing.`, undefined, true);
+      }
       const lastRecorded = job.evidence.pushed_shas[job.evidence.pushed_shas.length - 1] ?? "";
       const pushed = str(params["pushed_sha"]) || lastRecorded;
       const dogfood = strArray(params["dogfood"]);

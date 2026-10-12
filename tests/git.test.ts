@@ -188,6 +188,44 @@ gitTest("commitFiles stages only the listed paths", () => {
   assert.ok(liveDirtyPaths(s.worktree).includes("b.ts"), "unrelated file must stay dirty");
 });
 
+gitTest("commitFiles never sweeps previously staged unrelated files", () => {
+  const s = sandbox();
+  fs.writeFileSync(path.join(s.worktree, "target.ts"), "export const t = 1;\n", "utf8");
+  fs.writeFileSync(path.join(s.worktree, "unrelated.ts"), "export const u = 2;\n", "utf8");
+  // Hostile pre-state: the unrelated file is already staged.
+  git(s.worktree, "add", "unrelated.ts");
+  const res = commitFiles(s.worktree, "feat: only target", ["target.ts"]);
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.staged, ["target.ts"]);
+  assert.deepEqual(res.committed, ["target.ts"], "actual commit tree must match the selection");
+  // Unrelated index/worktree state is preserved, not committed.
+  const staged = git(s.worktree, "diff", "--cached", "--name-only");
+  assert.ok(staged.split(/\r?\n/).includes("unrelated.ts"), "unrelated file stays staged");
+  assert.ok(liveDirtyPaths(s.worktree).includes("unrelated.ts"));
+});
+
+gitTest("pushAndVerify refuses retargeting HEAD to another ref", () => {
+  const s = sandbox();
+  // s.worktree is checked out on studio-task; pushing it as feature/other rewrites that ref.
+  const res = pushAndVerify(s.worktree, "feature/other");
+  assert.equal(res.ok, false);
+  assert.match(res.detail, /different ref/);
+  const refs = git(s.repo, "ls-remote", s.remote);
+  assert.ok(!refs.includes("refs/heads/feature/other"), "no remote write happened");
+});
+
+gitTest("protected branches include bootstrap and configured targets", () => {
+  assert.equal(isProtectedBranch("bootstrap"), true);
+  assert.equal(isProtectedBranch("bootstrap/agent-x-foundation"), true);
+  assert.equal(isProtectedBranch("Bootstrap/X", ["custom-integration"]), true);
+  assert.equal(isProtectedBranch("feature/work"), false);
+  assert.equal(isProtectedBranch("feature/work", ["feature/work"]), true, "configured targets are protected");
+  const s = sandbox();
+  const res = pushAndVerify(s.worktree, "studio-task", "origin", { protectedBranches: ["studio-task"] });
+  assert.equal(res.ok, false);
+  assert.match(res.detail, /protected branch/);
+});
+
 gitTest("commitFiles refuses empty selections and hostile pathspecs stay inert", () => {
   const s = sandbox();
   const empty = commitFiles(s.worktree, "feat: nothing", []);

@@ -95,17 +95,20 @@ export const PROTECTED_BRANCHES = [
   "development",
   "trunk",
   "foundation",
+  "bootstrap",
   "release",
 ] as const;
 
-const PROTECTED_PREFIXES = ["release/", "foundation/"] as const;
+const PROTECTED_PREFIXES = ["release/", "foundation/", "bootstrap/"] as const;
 
-export function isProtectedBranch(branch: string): boolean {
+export function isProtectedBranch(branch: string, extraProtected: readonly string[] = []): boolean {
   const name = branch.trim();
   if (!name) return false;
   const lower = name.toLowerCase();
   if ((PROTECTED_BRANCHES as readonly string[]).includes(lower)) return true;
-  return PROTECTED_PREFIXES.some((prefix) => lower.startsWith(prefix));
+  if (PROTECTED_PREFIXES.some((prefix) => lower.startsWith(prefix))) return true;
+  // Exact configured integration targets (e.g. from repo-local Studio config).
+  return extraProtected.some((entry) => entry.trim().toLowerCase() === lower);
 }
 
 /** Repo-relative dirty paths from porcelain status (tracked and untracked). */
@@ -171,17 +174,33 @@ export interface PushResult {
 
 /**
  * Push the current branch and verify the remote SHA in one deterministic step.
- * Never force-pushes and never merges on Matthew's behalf.
+ * Never force-pushes and never merges on Matthew's behalf. Refuses protected
+ * branches and refuses to push HEAD to a ref other than the checked-out
+ * branch, before touching the network.
  */
-export function pushAndVerify(root: string, branch: string, remoteName = "origin"): PushResult {
+export function pushAndVerify(
+  root: string,
+  branch: string,
+  remoteName = "origin",
+  opts: { protectedBranches?: readonly string[] } = {},
+): PushResult {
   const head = run("git", ["rev-parse", "HEAD"], root);
   if (!head.ok) return { ok: false, detail: head.stderr.trim() || "no HEAD", local_sha: "" };
   const localSha = head.stdout.trim();
   if (!branch) return { ok: false, detail: "detached HEAD: refusing to guess a branch", local_sha: localSha };
-  if (isProtectedBranch(branch)) {
+  if (isProtectedBranch(branch, opts.protectedBranches)) {
     return {
       ok: false,
       detail: `refusing to push protected branch '${branch}': ship mission work on an isolated feature branch (Lucy merges integration branches)`,
+      local_sha: localSha,
+    };
+  }
+  const current = run("git", ["rev-parse", "--abbrev-ref", "HEAD"], root);
+  const checkout = current.ok ? current.stdout.trim() : "";
+  if (checkout && checkout !== "HEAD" && checkout !== branch) {
+    return {
+      ok: false,
+      detail: `refusing to push HEAD (${checkout}) to a different ref '${branch}': check out the target branch first`,
       local_sha: localSha,
     };
   }
@@ -201,25 +220,36 @@ export interface CommitResult {
   detail: string;
   /** Exact pathspecs staged for this commit, in the order given. */
   staged: string[];
+  /** Paths the resulting commit actually contains (read back from git). */
+  committed: string[];
 }
 
 /**
- * Commit exactly the given repo-relative pathspecs — never a bare `git add -A`.
- * Array argv (no shell) keeps hostile filenames inert. An empty selection is
- * refused instead of silently committing everything or nothing.
+ * Commit exactly the given repo-relative pathspecs — never a bare `git add -A`
+ * and never a bare `git commit` (which would sweep in previously staged
+ * unrelated files). Array argv (no shell) keeps hostile filenames inert. An
+ * empty selection is refused instead of silently committing everything.
+ * The committed tree is read back so callers record reality, not intent.
  */
 export function commitFiles(root: string, message: string, paths: string[]): CommitResult {
   const clean = paths.map((p) => p.trim()).filter(Boolean);
-  if (!message.trim()) return { ok: false, sha: "", detail: "commit message is required", staged: [] };
-  if (!clean.length) return { ok: false, sha: "", detail: "no paths selected for commit", staged: [] };
+  const none = { ok: false, sha: "", detail: "", staged: [] as string[], committed: [] as string[] };
+  if (!message.trim()) return { ...none, detail: "commit message is required" };
+  if (!clean.length) return { ...none, detail: "no paths selected for commit" };
   const add = run("git", ["add", "--", ...clean], root);
-  if (!add.ok) return { ok: false, sha: "", detail: add.stderr.trim() || "git add failed", staged: [] };
+  if (!add.ok) return { ...none, detail: add.stderr.trim() || "git add failed" };
   const status = run("git", ["status", "--porcelain=v1"], root);
-  if (!status.stdout.trim()) return { ok: true, sha: run("git", ["rev-parse", "HEAD"], root).stdout.trim(), detail: "nothing to commit", staged: clean };
-  const commit = run("git", ["commit", "-m", message], root, 60_000);
-  if (!commit.ok) return { ok: false, sha: "", detail: commit.stderr.trim().split(/\r?\n/)[0] || "commit failed", staged: clean };
-  const sha = run("git", ["rev-parse", "HEAD"], root);
-  return { ok: true, sha: sha.stdout.trim(), detail: "committed", staged: clean };
+  if (!status.stdout.trim()) {
+    return { ok: true, sha: run("git", ["rev-parse", "HEAD"], root).stdout.trim(), detail: "nothing to commit", staged: clean, committed: [] };
+  }
+  // Pathspec-restricted commit: previously staged unrelated files stay
+  // staged and uncommitted instead of being swept in.
+  const commit = run("git", ["commit", "-m", message, "--", ...clean], root, 60_000);
+  if (!commit.ok) return { ...none, staged: clean, detail: commit.stderr.trim().split(/\r?\n/)[0] || "commit failed" };
+  const sha = run("git", ["rev-parse", "HEAD"], root).stdout.trim();
+  const show = run("git", ["show", "--name-only", "--format=", "HEAD"], root);
+  const committed = show.ok ? show.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean) : [];
+  return { ok: true, sha, detail: "committed", staged: clean, committed };
 }
 
 /**

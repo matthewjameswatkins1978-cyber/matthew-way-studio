@@ -203,6 +203,70 @@ test("an unrelated small prompt neither duplicates nor disturbs the mission", as
   assert.match(small.systemPromptOptions.sections?.["studio_mission"] ?? "", /STUDIO/, "state stays understandable, not silent");
 });
 
+test("ship refuses protected branches before any write", async () => {
+  const { dir } = tempRepo();
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  const headBefore = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+  fs.writeFileSync(path.join(dir, "work.ts"), "export const w = 1;\n", "utf8");
+  // commit:true on main must be refused BEFORE committing or pushing.
+  const refused = await harness.tools.get("studio_ship")!.execute("p1", { commit: true, message: "sneaky", paths: ["work.ts"], branch: "main" }, undefined, undefined, ctx);
+  assert.match(refused.content[0]?.text ?? "", /protected branch/);
+  assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim(), headBefore, "no local commit happened");
+  assert.ok(fs.existsSync(path.join(dir, "work.ts")), "worktree preserved");
+});
+
+test("ship commit requires explicit paths and complete rejects fabricated revisions", async () => {
+  const { dir } = tempRepo();
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  fs.writeFileSync(path.join(dir, "work.ts"), "export const w = 1;\n", "utf8");
+  execFileSync("git", ["checkout", "-b", "probe/scope"], { cwd: dir });
+  const noScope = await harness.tools.get("studio_ship")!.execute("s1", { commit: true, message: "vague", branch: "probe/scope" }, undefined, undefined, ctx);
+  assert.match(noScope.content[0]?.text ?? "", /explicit paths/);
+  assert.match(noScope.content[0]?.text ?? "", /work\.ts/, "dirty set shown to guide explicit scope");
+  // Fabricated branch/head that differ from the live checkout are refused, for any outcome.
+  const badBranch = await harness.tools.get("studio_complete")!.execute("s2", { outcome: "PARTIAL", summary: "x", branch: "ghost/other" }, undefined, undefined, ctx);
+  assert.match(badBranch.content[0]?.text ?? "", /does not match the live checkout/);
+  const badHead = await harness.tools.get("studio_complete")!.execute(
+    "s3",
+    { outcome: "COMPLETE", summary: "fabricated", head_sha: "f".repeat(40), pushed_sha: "f".repeat(40), push_verified: true },
+    undefined,
+    undefined,
+    ctx,
+  );
+  assert.match(badHead.content[0]?.text ?? "", /does not match live HEAD/);
+});
+
+test("human confirmation flows only through the NEEDS_HUMAN resume edge", async () => {
+  const { dir } = tempRepo();
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  // Mid-flight confirmation claims are refused outright.
+  const refused = await harness.tools.get("studio_checkpoint")!.execute("h1", { next_action: "go", human_confirmed: [2] }, undefined, undefined, ctx);
+  assert.match(refused.content[0]?.text ?? "", /only counts on the NEEDS_HUMAN resume edge/);
+  // Block for GUI verification, human replies, resume carries the confirmation.
+  await harness.tools.get("studio_blocked")!.execute(
+    "h2",
+    { kind: "judgement", reason: "needs eyes", exact_human_need: "eyeball item 2", resume_condition: "reply" },
+    undefined,
+    undefined,
+    ctx,
+  );
+  const resumed = await harness.tools.get("studio_checkpoint")!.execute("h3", { next_action: "finish", human_confirmed: [2] }, undefined, undefined, ctx);
+  assert.match(resumed.content[0]?.text ?? "", /CHECKPOINT OK · WORKING/);
+  const job = readJob(ledgerLocation(dir));
+  assert.equal(job.kind, "loaded");
+  if (job.kind !== "loaded") return;
+  assert.deepEqual(job.job.evidence.human_confirmed, [2]);
+});
+
 test("optional legacy command forwards into the ordinary packet path", async () => {
   const harness = makeHarness();
   const sent: string[] = [];

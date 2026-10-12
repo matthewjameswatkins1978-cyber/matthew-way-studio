@@ -226,18 +226,38 @@ test("verify_push=false over stale evidence cannot complete", () => {
   assert.equal(gate.ok, true, gate.problems.join(", "));
 });
 
-test("dogfood citing #n covers human-verified acceptance items", () => {
+test("agent-supplied dogfood citations never cover acceptance", () => {
   const head = "d".repeat(40);
   let job = startMission({ packet: PACKET, location: location(), facts: facts() });
   job = applyCheckpoint(job, {
     checks: [{ name: "npm test", status: "pass", accepts: [1] }],
     pushed_shas: [head],
   });
+  // Even an explicit #2 citation in dogfood is a request, not evidence.
   const cited = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: head, dogfood: ["#2 renders correctly in the GUI"] });
-  assert.equal(cited.ok, true, cited.problems.join(", "));
-  const uncited = evaluateCompletion(job, { outcome: "COMPLETE", summary: "done", head_sha: head, dogfood: ["looks fine generally"] });
-  assert.equal(uncited.ok, false);
-  assert.ok(uncited.problems.some((p) => /acceptance items without passing evidence: #2/.test(p)));
+  assert.equal(cited.ok, false);
+  assert.ok(cited.problems.some((p) => /acceptance items without passing evidence: #2/.test(p)));
+});
+
+test("human confirmation counts only on the NEEDS_HUMAN resume edge", () => {
+  const head = "e".repeat(40);
+  // Mid-flight fabrication is ignored at the pure layer...
+  let working = startMission({ packet: PACKET, location: location(), facts: facts() });
+  working = applyCheckpoint(working, { next_action: "go", human_confirmed: [2] });
+  assert.deepEqual(working.evidence.human_confirmed, []);
+  assert.equal(working.status, "WORKING");
+  // ...but a confirmation arriving with a genuine resume is stored.
+  let blocked = applyBlock(working, { kind: "judgement", reason: "r", exact_human_need: "eyeball #2", resume_condition: "reply" });
+  blocked = applyCheckpoint(blocked, {
+    next_action: "finish",
+    checks: [{ name: "npm test", status: "pass", accepts: [1] }],
+    pushed_shas: [head],
+    human_confirmed: [2, 99],
+  });
+  assert.equal(blocked.status, "WORKING");
+  assert.deepEqual(blocked.evidence.human_confirmed, [2], "out-of-range confirmations are dropped");
+  const gate = evaluateCompletion(blocked, { outcome: "COMPLETE", summary: "done", head_sha: head });
+  assert.equal(gate.ok, true, gate.problems.join(", "));
 });
 
 test("a dirty worktree blocks COMPLETE but not PARTIAL", () => {
