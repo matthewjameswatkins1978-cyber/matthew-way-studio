@@ -225,31 +225,80 @@ export interface CommitResult {
 }
 
 /**
- * Commit exactly the given repo-relative pathspecs — never a bare `git add -A`
+ * Resolve one caller-supplied scope entry to an exact repo-relative file.
+ * Refuses pathspec magic (`:...`), absolute paths, `..` escapes, and anything
+ * that is not an existing file: wildcards, directories, and missing paths
+ * fail here because no literal file matches them. A tracked-but-deleted file
+ * is accepted so deletions stay committable. Returned paths use `/` so Git
+ * always sees the same spelling it reports back.
+ */
+function exactScopeFile(root: string, entry: string): { file?: string; refusal?: string } {
+  const raw = entry.trim();
+  if (!raw) return { refusal: "empty path" };
+  if (raw.startsWith(":") || raw.includes(":(")) return { refusal: `pathspec magic is unsupported: ${raw}` };
+  if (path.isAbsolute(raw) || /(^|[\\/])\.\.([\\/]|$)/.test(raw)) return { refusal: `path escapes the repository: ${raw}` };
+  const abs = path.resolve(root, raw);
+  const rel = path.relative(root, abs);
+  if (!rel || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
+    return { refusal: `path escapes the repository: ${raw}` };
+  }
+  const unix = rel.split(path.sep).join("/");
+  try {
+    if (fs.statSync(abs).isFile()) return { file: unix };
+    return { refusal: `not a file (directory scope is unsupported): ${raw}` };
+  } catch {
+    // A tracked file deleted from the worktree is committable scope. The
+    // literal prefix keeps a glob-shaped name from matching anything else.
+    const tracked = run("git", ["ls-files", "--error-unmatch", "--", `:(literal)${unix}`], root);
+    if (tracked.ok) return { file: unix };
+    return { refusal: `no such file in the repository: ${raw}` };
+  }
+}
+
+/**
+ * Commit exactly the given repo-relative files — never a bare `git add -A`
  * and never a bare `git commit` (which would sweep in previously staged
- * unrelated files). Array argv (no shell) keeps hostile filenames inert. An
- * empty selection is refused instead of silently committing everything.
- * The committed tree is read back so callers record reality, not intent.
+ * unrelated files). Every entry must resolve to one existing file BEFORE any
+ * git write, and Git receives each scope as a `:(literal)` pathspec so even
+ * a glob-shaped filename cannot widen the commit. Array argv (no shell)
+ * keeps hostile filenames inert. An empty selection is refused instead of
+ * silently committing everything. The committed tree is read back and checked
+ * for containment, so callers record reality, not intent.
  */
 export function commitFiles(root: string, message: string, paths: string[]): CommitResult {
   const clean = paths.map((p) => p.trim()).filter(Boolean);
   const none = { ok: false, sha: "", detail: "", staged: [] as string[], committed: [] as string[] };
   if (!message.trim()) return { ...none, detail: "commit message is required" };
   if (!clean.length) return { ...none, detail: "no paths selected for commit" };
-  const add = run("git", ["add", "--", ...clean], root);
-  if (!add.ok) return { ...none, detail: add.stderr.trim() || "git add failed" };
-  const status = run("git", ["status", "--porcelain=v1"], root);
-  if (!status.stdout.trim()) {
-    return { ok: true, sha: run("git", ["rev-parse", "HEAD"], root).stdout.trim(), detail: "nothing to commit", staged: clean, committed: [] };
+  const files: string[] = [];
+  for (const entry of clean) {
+    const scope = exactScopeFile(root, entry);
+    if (!scope.file) {
+      return { ...none, detail: `refusing broad scope '${entry}': ${scope.refusal}. Pass exact repo-relative file paths.` };
+    }
+    files.push(scope.file);
   }
-  // Pathspec-restricted commit: previously staged unrelated files stay
-  // staged and uncommitted instead of being swept in.
-  const commit = run("git", ["commit", "-m", message, "--", ...clean], root, 60_000);
-  if (!commit.ok) return { ...none, staged: clean, detail: commit.stderr.trim().split(/\r?\n/)[0] || "commit failed" };
+  const literal = files.map((f) => `:(literal)${f}`);
+  const add = run("git", ["add", "--", ...literal], root);
+  if (!add.ok) return { ...none, staged: files, detail: add.stderr.trim() || "git add failed" };
+  const scoped = run("git", ["status", "--porcelain=v1", "--", ...literal], root);
+  if (!scoped.stdout.trim()) {
+    return { ok: true, sha: run("git", ["rev-parse", "HEAD"], root).stdout.trim(), detail: "nothing to commit", staged: files, committed: [] };
+  }
+  const commit = run("git", ["commit", "-m", message, "--", ...literal], root, 60_000);
+  if (!commit.ok) return { ...none, staged: files, detail: commit.stderr.trim().split(/\r?\n/)[0] || "commit failed" };
   const sha = run("git", ["rev-parse", "HEAD"], root).stdout.trim();
   const show = run("git", ["show", "--name-only", "--format=", "HEAD"], root);
   const committed = show.ok ? show.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean) : [];
-  return { ok: true, sha, detail: "committed", staged: clean, committed };
+  // Containment check: the commit must hold ONLY selected files. The exact
+  // scope gate plus literal pathspecs make a violation unreachable; if one
+  // ever lands, report it as a failure instead of declaring success.
+  const selected = new Set(files);
+  const outside = committed.filter((c) => !selected.has(c.replace(/\\/g, "/")));
+  if (outside.length > 0) {
+    return { ok: false, sha, staged: files, committed, detail: `commit ${sha.slice(0, 10)} contains paths outside the selected files: ${outside.join(", ")}` };
+  }
+  return { ok: true, sha, detail: "committed", staged: files, committed };
 }
 
 /**

@@ -234,3 +234,34 @@ gitTest("commitFiles refuses empty selections and hostile pathspecs stay inert",
   const missing = commitFiles(s.worktree, "feat: ghost", ["no-such-file.ts"]);
   assert.equal(missing.ok, false);
 });
+
+gitTest("commitFiles refuses wildcard, directory and pathspec-magic scope before any write", () => {
+  const s = sandbox();
+  fs.writeFileSync(path.join(s.worktree, "target.txt"), "v2-target\n", "utf8");
+  fs.writeFileSync(path.join(s.worktree, "other.txt"), "v2-other\n", "utf8");
+  fs.mkdirSync(path.join(s.worktree, "sub"), { recursive: true });
+  fs.writeFileSync(path.join(s.worktree, "sub", "inner.txt"), "v2-inner\n", "utf8");
+  const before = git(s.worktree, "rev-parse", "HEAD");
+  const hostile = [["*.txt"], ["sub"], ["sub/"], [":(glob)**.txt"], [":(top)."], ["../outside.txt"], ["/abs/path.txt"]];
+  for (const scope of hostile) {
+    const res = commitFiles(s.worktree, "probe: broad scope", scope);
+    assert.equal(res.ok, false, `scope ${JSON.stringify(scope)} must be refused`);
+    assert.match(res.detail, /broad scope/);
+    assert.deepEqual(res.committed, []);
+  }
+  assert.equal(git(s.worktree, "rev-parse", "HEAD"), before, "refusals must not create a commit");
+  assert.equal(git(s.worktree, "diff", "--cached", "--name-only"), "", "refusals must not stage anything");
+  assert.equal(liveDirtyPaths(s.worktree).length, 3, "worktree left intact for review");
+});
+
+gitTest("commitFiles commits a literal filename containing glob characters", () => {
+  const s = sandbox();
+  // a[1].txt as a GLOB would also match a1.txt; as a literal it must not.
+  fs.writeFileSync(path.join(s.worktree, "a[1].txt"), "literal\n", "utf8");
+  fs.writeFileSync(path.join(s.worktree, "a1.txt"), "decoy\n", "utf8");
+  const res = commitFiles(s.worktree, "feat: literal name", ["a[1].txt"]);
+  assert.equal(res.ok, true, res.detail);
+  assert.deepEqual(res.staged, ["a[1].txt"]);
+  assert.deepEqual(res.committed, ["a[1].txt"], "glob-shaped names stay literal");
+  assert.ok(liveDirtyPaths(s.worktree).includes("a1.txt"), "decoy stays dirty");
+});

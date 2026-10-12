@@ -409,7 +409,7 @@ export function registerStudio(pi: PiApi): void {
       attempts: Type.Optional(Type.Number({ description: "Explicit attempt count for the current approach" })),
       child_work: Type.Optional(Type.String({ description: "What any delegated worker is doing, or 'none'" })),
       human_confirmed: Type.Optional(
-        Type.Array(Type.Integer({ minimum: 1 }), { description: "1-based acceptance items the human explicitly confirmed. Honored ONLY on the NEEDS_HUMAN resume edge; refused anywhere else." }),
+        Type.Array(Type.Integer({ minimum: 1 }), { description: "Confirmations are never recorded: no verified human-turn boundary exists in-process. Supplying this refuses the checkpoint; close human-gated work as PARTIAL." }),
       ),
       reconciliation: Type.Optional(Type.String({ description: "Small corrected assumption/crossed wire; preserves history and continues the same mission" })),
       lantern: Type.Optional(Type.String({ description: "used | not-needed | unavailable" })),
@@ -426,18 +426,18 @@ export function registerStudio(pi: PiApi): void {
       const humanConfirmed = Array.isArray(params["human_confirmed"])
         ? [...new Set(params["human_confirmed"].filter((n): n is number => typeof n === "number" && Number.isInteger(n) && n >= 1))].slice(0, 32)
         : [];
-      if (humanConfirmed.length && job.status !== "NEEDS_HUMAN") {
+      if (humanConfirmed.length) {
         return textResult(
-          "human_confirmed only counts on the NEEDS_HUMAN resume edge: confirmations without a preceding human turn are refused. If GUI verification is still outstanding, block with studio_blocked or close as PARTIAL.",
+          "human_confirmed is never honored: no verified human-turn boundary exists in-process, so NEEDS_HUMAN status cannot prove Matthew replied. Confirmations are not recorded and can never cover acceptance items. If human verification is outstanding, block with studio_blocked or close as PARTIAL.",
           undefined,
           true,
         );
       }
+
       const updated = applyCheckpoint(job, {
         milestone: str(params["milestone"]),
         next_action: str(params["next_action"]),
         checks,
-        human_confirmed: humanConfirmed.length ? humanConfirmed : undefined,
         commits: strArray(params["commits"]),
         pushed_shas: strArray(params["pushed_shas"]),
         artifacts: strArray(params["artifacts"]),
@@ -672,7 +672,7 @@ export function registerStudio(pi: PiApi): void {
     name: "studio_complete",
     label: "Studio complete",
     description:
-      "Close the mission as COMPLETE, PARTIAL or FAILED and produce the concise evidence receipt for Lucy/ChatGPT review. Supplied branch/head_sha must equal the live checkout. COMPLETE is refused while acceptance items lack passing checks tagged with accepts:[n] (human-verified items count only via checkpoint human_confirmed on the NEEDS_HUMAN resume edge — dogfood requests never cover), a recorded check is failing, the worktree is dirty, or the final revision is not confirmed on the remote.",
+      "Close the mission as COMPLETE, PARTIAL or FAILED and produce the concise evidence receipt for Lucy/ChatGPT review. Supplied branch/head_sha must equal the live checkout. COMPLETE is refused while acceptance items lack passing checks tagged with accepts:[n] (human-gated items can never count toward COMPLETE — no verified human-turn boundary exists in-process; close them as PARTIAL — dogfood requests never cover), a recorded check is failing, the worktree is dirty, or the final revision is not confirmed on the remote.",
     promptSnippet: "Finish the mission and emit the concise evidence receipt.",
     promptGuidelines: [
       "Call studio_complete only when the mission's acceptance is materially satisfied or the remainder is explicit human dogfood.",
@@ -685,7 +685,7 @@ export function registerStudio(pi: PiApi): void {
       branch: Type.Optional(Type.String()),
       pushed_sha: Type.Optional(Type.String({ description: "SHA pushed to the remote" })),
       verify_push: Type.Optional(Type.Boolean({ description: "Re-check the remote SHA now (default true for COMPLETE)" })),
-      dogfood: Type.Optional(Type.Array(Type.String({ description: "Short human checks, one step each. A dogfood request never counts as evidence; outstanding GUI items leave COMPLETE for PARTIAL until a human confirms via the NEEDS_HUMAN resume edge." }))),
+      dogfood: Type.Optional(Type.Array(Type.String({ description: "Short human checks, one step each. A dogfood request never counts as evidence; outstanding GUI items leave COMPLETE for PARTIAL (no in-process confirmation is honored)." }))),
     }),
     execute: async (_id, params, _signal, _update, ctx) => {
       const rt = runtimeFor(ctx);

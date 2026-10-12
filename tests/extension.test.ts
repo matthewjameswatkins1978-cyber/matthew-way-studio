@@ -242,7 +242,7 @@ test("ship commit requires explicit paths and complete rejects fabricated revisi
   assert.match(badHead.content[0]?.text ?? "", /does not match live HEAD/);
 });
 
-test("human confirmation flows only through the NEEDS_HUMAN resume edge", async () => {
+test("human confirmations are refused mid-flight and on the resume edge", async () => {
   const { dir } = tempRepo();
   const harness = makeHarness();
   registerStudio(harness.api);
@@ -250,8 +250,9 @@ test("human confirmation flows only through the NEEDS_HUMAN resume edge", async 
   await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
   // Mid-flight confirmation claims are refused outright.
   const refused = await harness.tools.get("studio_checkpoint")!.execute("h1", { next_action: "go", human_confirmed: [2] }, undefined, undefined, ctx);
-  assert.match(refused.content[0]?.text ?? "", /only counts on the NEEDS_HUMAN resume edge/);
-  // Block for GUI verification, human replies, resume carries the confirmation.
+  assert.match(refused.content[0]?.text ?? "", /never honored/);
+  // A block followed by an immediate same-run confirmation is refused too:
+  // NEEDS_HUMAN status cannot prove a human replied.
   await harness.tools.get("studio_blocked")!.execute(
     "h2",
     { kind: "judgement", reason: "needs eyes", exact_human_need: "eyeball item 2", resume_condition: "reply" },
@@ -259,14 +260,15 @@ test("human confirmation flows only through the NEEDS_HUMAN resume edge", async 
     undefined,
     ctx,
   );
-  const resumed = await harness.tools.get("studio_checkpoint")!.execute("h3", { next_action: "finish", human_confirmed: [2] }, undefined, undefined, ctx);
-  assert.match(resumed.content[0]?.text ?? "", /CHECKPOINT OK · WORKING/);
+  const refusedResume = await harness.tools.get("studio_checkpoint")!.execute("h3", { next_action: "finish", human_confirmed: [2] }, undefined, undefined, ctx);
+  assert.equal(refusedResume.isError, true);
+  assert.match(refusedResume.content[0]?.text ?? "", /never honored/);
   const job = readJob(ledgerLocation(dir));
   assert.equal(job.kind, "loaded");
   if (job.kind !== "loaded") return;
-  assert.deepEqual(job.job.evidence.human_confirmed, [2]);
+  assert.deepEqual(job.job.evidence.human_confirmed, [], "nothing recorded");
+  assert.equal(job.job.status, "NEEDS_HUMAN", "the block stands until genuine work resumes it");
 });
-
 test("optional legacy command forwards into the ordinary packet path", async () => {
   const harness = makeHarness();
   const sent: string[] = [];
@@ -671,4 +673,24 @@ test("studio_context prefers live Lantern and degrades honestly", async () => {
     assert.match(snapshotText, /degraded read-only snapshot/);
     assert.equal((readJob(location) as any).job.memory.lantern, "used");
   }
+});
+
+test("studio_checkpoint refuses human_confirmed even on the NEEDS_HUMAN resume edge", async () => {
+  const { dir } = tempRepo();
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  const location = ledgerLocation(dir);
+  await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  await harness.tools.get("studio_blocked")!.execute("h1", { kind: "judgement", reason: "needs eyeballs", exact_human_need: "eyeball the GUI", resume_condition: "reply" }, undefined, undefined, ctx);
+  // Same-run false confirmation: no human turn happened between the block
+  // and this checkpoint, so the confirmation must be refused, not recorded.
+  const refused = await harness.tools.get("studio_checkpoint")!.execute("h2", { next_action: "finish", human_confirmed: [1] }, undefined, undefined, ctx);
+  assert.equal(refused.isError, true, "confirmations are refused, not stored");
+  assert.match(refused.content[0]?.text ?? "", /never honored/);
+  const job = readJob(location);
+  assert.equal(job.kind, "loaded");
+  if (job.kind !== "loaded") return;
+  assert.deepEqual(job.job.evidence.human_confirmed, [], "nothing recorded");
+  assert.equal(job.job.status, "NEEDS_HUMAN", "the refusal does not pop the block");
 });

@@ -125,9 +125,10 @@ export interface CheckpointInput {
   attempts?: number;
   child_work?: string;
   /**
-   * 1-based acceptance items the human explicitly confirmed. Honored ONLY
-   * when this checkpoint performs the NEEDS_HUMAN resume edge; otherwise
-   * ignored (the tool layer refuses it outright).
+   * Accepted for forward compatibility and IGNORED: no verified human-turn
+   * boundary exists in-process, so confirmations are never recorded and can
+   * never cover acceptance items. The tool layer refuses this input loudly.
+
    */
   human_confirmed?: number[];
   /** Small corrected assumption/crossed wire. Preserved without rewriting mission history. */
@@ -214,16 +215,14 @@ export function applyCheckpoint(job: JobState, input: CheckpointInput): JobState
     next.continuation = { ...next.continuation, runs: 0, unchanged_streak: 0, error_streak: 0, allowed: true, reason: "resumed by checkpoint" };
     next.blocker = undefined;
     next.human_dogfood = job.human_dogfood.status === "pending" ? { status: "done", checks: job.human_dogfood.checks } : job.human_dogfood;
-    // Human confirmations land here and only here: the resume edge
-    // structurally follows a human turn, so a claimed confirmation cannot
-    // be manufactured mid-flight without passing through NEEDS_HUMAN first.
-    if (input.human_confirmed?.length) {
-      const valid = input.human_confirmed.filter((n) => Number.isInteger(n) && n >= 1 && n <= job.acceptance.length);
-      next.evidence = {
-        ...next.evidence,
-        human_confirmed: [...new Set([...next.evidence.human_confirmed, ...valid])].slice(0, 32),
-      };
-    }
+    // Human confirmations are NEVER recorded: no observable human-turn
+    // boundary exists in-process. A checkpoint runs inside the agent turn,
+    // so NEEDS_HUMAN status alone cannot prove a human replied between the
+    // block and this call. Claimed confirmations are dropped, which keeps
+    // human-gated acceptance items uncovered and forces PARTIAL. (The input
+    // field is accepted for forward compatibility; the tool layer refuses it
+    // loudly so callers learn the boundary immediately.)
+    // (human_confirmed input intentionally unused — see above.)
   } else if (terminalStatus(job.status)) {
     // Recording evidence against a closed mission is allowed; reopening is not.
     next.continuation = { ...next.continuation, allowed: false };
@@ -285,23 +284,24 @@ export function evaluateCompletion(
   if (input.outcome === "COMPLETE") {
     if (job.evidence.checks.length === 0) problems.push("no machine evidence recorded (at least one check is required)");
     // Positive binding: every acceptance item needs a passing check that
-    // names its index, or an explicit human confirmation recorded on the
-    // NEEDS_HUMAN resume edge. Agent-supplied dogfood citations never cover:
-    // a request for a human check is not a human-check PASS. Uncovered and
-    // unconfirmed items leave COMPLETE for PARTIAL (or NEEDS_HUMAN first).
+    // names its index. Agent-supplied dogfood citations never cover, and no
+    // in-process confirmation counts as a human check: a confirmation claim
+    // is not a human-check PASS. Items only a human can verify leave
+    // COMPLETE for PARTIAL (or NEEDS_HUMAN first).
+
     if (job.acceptance.length > 0) {
       const covered = new Set<number>();
       for (const check of job.evidence.checks) {
         if (check.status !== "pass") continue;
         for (const index of check.accepts ?? []) covered.add(index);
       }
-      for (const confirmed of job.evidence.human_confirmed) {
-        if (confirmed >= 1 && confirmed <= job.acceptance.length) covered.add(confirmed);
-      }
+      // Human confirmations never cover acceptance items: none are recorded
+      // (see applyCheckpoint), so items only a human can verify stay
+      // uncovered and refuse COMPLETE for PARTIAL/NEEDS_HUMAN.
       const missing = job.acceptance.map((_, i) => i + 1).filter((i) => !covered.has(i));
       if (missing.length > 0) {
         problems.push(
-          `acceptance items without passing evidence: ${missing.map((i) => `#${i} "${job.acceptance[i - 1]?.slice(0, 80) ?? ""}"`).join("; ")} — record checks with accepts:[n], confirm via checkpoint human_confirmed on the NEEDS_HUMAN resume edge, or close as PARTIAL`,
+          `acceptance items without passing evidence: ${missing.map((i) => `#${i} "${job.acceptance[i - 1]?.slice(0, 80) ?? ""}"`).join("; ")} — record checks with accepts:[n], close as PARTIAL/NEEDS_HUMAN when only a human can verify (no in-process confirmation is honored)`,
         );
       }
     }

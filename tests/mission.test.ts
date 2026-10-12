@@ -239,14 +239,16 @@ test("agent-supplied dogfood citations never cover acceptance", () => {
   assert.ok(cited.problems.some((p) => /acceptance items without passing evidence: #2/.test(p)));
 });
 
-test("human confirmation counts only on the NEEDS_HUMAN resume edge", () => {
+test("human confirmations are never recorded: same-run confirmation fails closed", () => {
   const head = "e".repeat(40);
-  // Mid-flight fabrication is ignored at the pure layer...
+  // Mid-flight fabrication is dropped at the pure layer...
   let working = startMission({ packet: PACKET, location: location(), facts: facts() });
   working = applyCheckpoint(working, { next_action: "go", human_confirmed: [2] });
   assert.deepEqual(working.evidence.human_confirmed, []);
   assert.equal(working.status, "WORKING");
-  // ...but a confirmation arriving with a genuine resume is stored.
+  // ...and a confirmation arriving on the NEEDS_HUMAN resume edge is dropped
+  // too: NEEDS_HUMAN status cannot prove a human replied, because the
+  // checkpoint itself runs inside the agent turn.
   let blocked = applyBlock(working, { kind: "judgement", reason: "r", exact_human_need: "eyeball #2", resume_condition: "reply" });
   blocked = applyCheckpoint(blocked, {
     next_action: "finish",
@@ -254,12 +256,15 @@ test("human confirmation counts only on the NEEDS_HUMAN resume edge", () => {
     pushed_shas: [head],
     human_confirmed: [2, 99],
   });
-  assert.equal(blocked.status, "WORKING");
-  assert.deepEqual(blocked.evidence.human_confirmed, [2], "out-of-range confirmations are dropped");
+  assert.equal(blocked.status, "WORKING", "the resume edge still reopens");
+  assert.deepEqual(blocked.evidence.human_confirmed, [], "confirmations are dropped even on the resume edge");
   const gate = evaluateCompletion(blocked, { outcome: "COMPLETE", summary: "done", head_sha: head });
-  assert.equal(gate.ok, true, gate.problems.join(", "));
+  assert.equal(gate.ok, false, "a human-gated item must refuse COMPLETE");
+  assert.ok(gate.problems.some((p) => /acceptance items without passing evidence: #2/.test(p)));
+  assert.ok(gate.problems.some((p) => /PARTIAL/.test(p)), "the refusal must point at PARTIAL");
+  const partial = evaluateCompletion(blocked, { outcome: "PARTIAL", summary: "needs a human to eyeball #2" });
+  assert.equal(partial.ok, true, partial.problems.join(", "));
 });
-
 test("a dirty worktree blocks COMPLETE but not PARTIAL", () => {
   let job = startMission({ packet: PACKET, location: location(), facts: facts() });
   job = applyCheckpoint(job, { checks: [{ name: "npm test", status: "pass", accepts: [1, 2] }], pushed_shas: ["c".repeat(40)] });
