@@ -24,6 +24,7 @@ export interface PiContext {
   hasUI: boolean;
   ui: PiUi;
   isProjectTrusted(): boolean;
+  sessionManager?: { getSessionId(): string } | undefined;
   model?: { provider?: string; id?: string } | undefined;
 }
 

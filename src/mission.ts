@@ -119,6 +119,39 @@ export function startMission(input: {
   };
 }
 
+export interface ReviewWaitInput {
+  repository: string;
+  pull_request: number;
+  url: string;
+  branch: string;
+  head_sha: string;
+  worker_session_id: string;
+  requested_review: "general" | "approval" | "correction";
+  requested_at?: string;
+}
+
+/** Enter a durable reviewer wait only when every identity matches this job. */
+export function applyReviewWait(job: JobState, input: ReviewWaitInput): JobState {
+  if (job.status === "WAITING_REVIEW") {
+    const current = job.review_wait;
+    if (current && current.repository === input.repository && current.pull_request === input.pull_request && current.head_sha.toLowerCase() === input.head_sha.toLowerCase() && current.worker_session_id === input.worker_session_id) return job;
+    throw new Error("a different reviewer wait is already active for this mission");
+  }
+  if (job.status !== "WORKING") throw new Error(`cannot wait for review while mission is ${job.status}`);
+  if (!input.repository || !input.pull_request || !input.url || !input.branch || !input.worker_session_id) throw new Error("review target is missing repository, PR, branch or worker identity");
+  if (job.repo.branch !== input.branch || job.repo.current_sha.toLowerCase() !== input.head_sha.toLowerCase()) throw new Error("review branch or head SHA does not match the mission's current repository state");
+  if (input.head_sha !== input.head_sha.toLowerCase() || !/^[0-9a-f]{40}$/.test(input.head_sha)) throw new Error("review head SHA must be a canonical 40-character lowercase SHA");
+  const now = input.requested_at ?? new Date().toISOString();
+  const transitioned = applyTransition(job, "WAITING_REVIEW");
+  return {
+    ...transitioned,
+    status: "WAITING_REVIEW",
+    review_wait: { ...input, job_id: job.job_id, requested_at: now },
+    blocker: undefined,
+    continuation: { ...job.continuation, allowed: false, reason: "waiting for reviewer decision" },
+    updated_at: now,
+  };
+}
 export interface CheckpointInput {
   milestone?: string;
   next_action?: string;

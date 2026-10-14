@@ -17,8 +17,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { registerStudio } from "../extensions/index.js";
-import { readJob, readEvents } from "../src/ledger.js";
+import { readJob, readEvents, writeJob } from "../src/ledger.js";
 import { ledgerLocation } from "../src/paths.js";
+import { applyReviewWait } from "../src/mission.js";
 import type {
   PiApi,
   PiBeforeAgentStartEvent,
@@ -528,6 +529,47 @@ test("a normal reply resumes the blocked mission and completion yields a receipt
   void remote;
 });
 
+test("review-waiting mission survives restart and repeated chat or settle cycles quietly", async () => {
+  const { dir } = tempRepo();
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  const location = ledgerLocation(dir);
+  await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
+  const seeded = readJob(location);
+  assert.equal(seeded.kind, "loaded");
+  if (seeded.kind !== "loaded") return;
+  const wait = applyReviewWait(seeded.job, {
+    repository: "acme/widget",
+    pull_request: 35,
+    url: "https://github.com/acme/widget/pull/35",
+    branch: seeded.job.repo.branch,
+    head_sha: seeded.job.repo.current_sha,
+    worker_session_id: "pi-session-a",
+    requested_review: "correction",
+    requested_at: "2026-10-14T20:00:00.000Z",
+  });
+  writeJob(location, wait);
+
+  const restarted = makeHarness();
+  registerStudio(restarted.api);
+  const restartedCtx = ctxFor(dir, restarted);
+  await emit(restarted, "session_start", { type: "session_start", reason: "resume" }, restartedCtx);
+  const followup: PiBeforeAgentStartEvent = { type: "before_agent_start", prompt: "go ahead", systemPrompt: "", systemPromptOptions: {} };
+  await emit(restarted, "before_agent_start", followup, restartedCtx);
+  assert.match(followup.systemPromptOptions.sections?.["studio_mission"] ?? "", /STUDIO WAITING_REVIEW/);
+  assert.equal(restarted.status.at(-1)?.includes("WAITING_REVIEW"), true);
+  const eventCount = readEvents(location, 200).length;
+  for (let i = 0; i < 5; i++) assert.equal(await emit(restarted, "agent_before_settle", boundaryEvent(), restartedCtx), undefined);
+  const after = readJob(location);
+  assert.equal(after.kind, "loaded");
+  if (after.kind === "loaded") {
+    assert.equal(after.job.status, "WAITING_REVIEW");
+    assert.deepEqual(after.job.continuation, wait.continuation, "waiting consumes no turns and remains disarmed");
+  }
+  assert.equal(readEvents(location, 200).length, eventCount, "quiet waits do not append repeated events");
+  assert.equal(restarted.notifications.length, 0, "restart does not repeat a warning or toast");
+});
 test("stop-loss converts a stalled loop into a resumable human need", async () => {
   const { dir } = tempRepo();
   const harness = makeHarness();
@@ -540,10 +582,7 @@ test("stop-loss converts a stalled loop into a resumable human need", async () =
   let last: PiBoundaryResult | undefined;
   for (let i = 0; i < 4; i++) last = (await emit(harness, "agent_before_settle", boundaryEvent(), ctx)) as PiBoundaryResult | undefined;
 
-  assert.ok(last, "the boundary kept acting while turns were unproductive");
-  assert.equal((last?.entries as any[])?.[0]?.customType, "studio-stop-loss", "the stall became an explicit instruction to block");
-  assert.match((last?.entries as any[])?.[0]?.content ?? "", /already moved this mission to NEEDS_HUMAN/);
-  assert.doesNotMatch((last?.entries as any[])?.[0]?.content ?? "", /Call studio_blocked now/, "stop-loss does not double-record its own blocker");
+  assert.equal(last, undefined, "a stalled mission settles without another model turn");
   const read = readJob(location);
   assert.equal(read.kind === "loaded" && read.job.status, "NEEDS_HUMAN");
   if (read.kind !== "loaded") return;

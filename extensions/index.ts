@@ -24,7 +24,8 @@ import { appendEvent, readJob, writeJob, readPacket, type JobReadResult } from "
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
-import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyMemory, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
+import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyMemory, applyReviewWait, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
+import { readPullRequest } from "../src/review.js";
 import { discoverLanternTools, lanternContextResult, readSnapshot } from "../src/lantern.js";
 import { isSubstantivePacket, detectControlIntent } from "../src/packet.js";
 import { renderMissionBrief, renderNeedsHuman, renderReceipt } from "../src/receipt.js";
@@ -66,6 +67,10 @@ function jobOf(rt: Runtime): JobState | undefined {
 
 function statusLine(job: JobState | undefined, config: StudioConfig): string | undefined {
   if (!job) return undefined;
+  if (job.status === "WAITING_REVIEW") {
+    const wait = job.review_wait;
+    return wait ? `studio: WAITING_REVIEW · PR #${wait.pull_request} @ ${wait.head_sha.slice(0, 7)}` : "studio: WAITING_REVIEW";
+  }
   if (job.status === "NEEDS_HUMAN") return `studio: NEEDS_HUMAN — ${job.blocker?.exact_human_need.slice(0, 60) ?? "blocked"}`;
   if (terminalStatus(job.status)) return `studio: ${job.status} ${job.repo.current_sha.slice(0, 7)}`;
   const milestone = job.progress.milestone ? ` · ${job.progress.milestone.slice(0, 30)}` : "";
@@ -102,6 +107,15 @@ function withSection(event: PiBeforeAgentStartEvent, body: string): void {
 
 function missionSection(job: JobState, config: StudioConfig): string {
   const brief = renderMissionBrief(job);
+  if (job.status === "WAITING_REVIEW") {
+    const wait = job.review_wait;
+    return [
+      brief,
+      "",
+      `STUDIO WAITING_REVIEW: awaiting an authorized decision on ${wait?.repository ?? "unknown repository"} PR #${wait?.pull_request ?? "?"} at ${wait?.head_sha ?? "unknown SHA"}.`,
+      "This job is durably paused. Do not poll, continue, change its target, or treat ordinary chat as a review decision.",
+    ].join("\n");
+  }
   if (job.status === "NEEDS_HUMAN") {
     return [
       brief,
@@ -202,6 +216,11 @@ export function registerStudio(pi: PiApi): void {
       return undefined;
     }
 
+    if (job?.status === "WAITING_REVIEW") {
+      updateStatus(ctx, job, rt.config);
+      withSection(event, missionSection(job, rt.config));
+      return undefined;
+    }
     // Ordinary language controls the loop; no ritual commands required.
     if (job) {
       const intent = detectControlIntent(prompt);
@@ -280,7 +299,7 @@ export function registerStudio(pi: PiApi): void {
       const rt = runtimeFor(ctx);
       const job = jobOf(rt);
       if (!job || !rt.config.autoContinue) return undefined;
-      if (terminalStatus(job.status) || job.status === "NEEDS_HUMAN") {
+      if (terminalStatus(job.status) || job.status === "NEEDS_HUMAN" || job.status === "WAITING_REVIEW") {
         updateStatus(ctx, job, rt.config);
         return undefined;
       }
@@ -311,23 +330,8 @@ export function registerStudio(pi: PiApi): void {
         writeJob(rt.location, stalled);
         appendEvent(rt.location, "stop-loss", { job_id: job.job_id, reason: decision.reason, signature: progressSignature(job) });
         updateStatus(ctx, stalled, rt.config);
-        safeNotify(ctx, `studio: stop-loss — ${decision.reason}. Asking Matthew for a steer.`, "warning");
-        return {
-          entries: [
-            ...priorEntries,
-            customMessage(
-              "studio-stop-loss",
-              [
-                `STUDIO STOP-LOSS (${stalled.job_id}): ${decision.reason}.`,
-                "The runtime has already moved this mission to NEEDS_HUMAN and preserved its state. Do not call studio_blocked again.",
-                "Give Matthew the existing NEEDS_HUMAN summary: ask for one steer, explain why, state what is already complete, repo/branch/SHA, and the next action after he replies.",
-              ].join("\n"),
-              false,
-              { job_id: stalled.job_id, reason: decision.reason },
-            ),
-          ],
-          continue: true,
-        };
+        safeNotify(ctx, `studio: stop-loss — ${decision.reason}. Reply with a steer when ready to resume.`, "warning");
+        return undefined;
       }
 
       const continued: JobState = { ...job, continuation: decision.continuation, updated_at: new Date().toISOString() };
@@ -375,6 +379,56 @@ export function registerStudio(pi: PiApi): void {
 
   // ---------------------------------------------------------------- tools ----
 
+  pi.registerTool({
+    name: "studio_wait_for_review",
+    label: "Studio wait for review",
+    description: "Checkpoint a pushed pull request and stop autonomous turns while an authorized reviewer considers the exact current head. Studio verifies the live GitHub PR repository, branch, open state and head SHA before entering WAITING_REVIEW.",
+    promptSnippet: "When the mission is pushed and genuinely waiting for review, register the exact PR and stop the worker cleanly.",
+    parameters: Type.Object({
+      pull_request: Type.Integer({ minimum: 1, description: "Open pull request number in the mission repository" }),
+      requested_review: Type.Optional(Type.String({ description: "general | approval | correction" })),
+    }),
+    execute: async (_id, params, _signal, _update, ctx) => {
+      const rt = runtimeFor(ctx);
+      const job = jobOf(rt);
+      if (!job) return textResult("No active Studio mission to place in review wait.", undefined, true);
+      const sessionId = ctx.sessionManager?.getSessionId();
+      if (!sessionId) return textResult("Cannot record WAITING_REVIEW: this Pi context does not expose a stable session ID.", undefined, true);
+      const requestedReview = str(params["requested_review"]) ?? "general";
+      if (!["general", "approval", "correction"].includes(requestedReview)) return textResult("requested_review must be general, approval, or correction.", undefined, true);
+      const repository = canonicalRepo(job.repo.remote);
+      const number = num(params["pull_request"]);
+      if (!repository || !number || !Number.isInteger(number)) return textResult("Mission remote or pull request number is not a valid GitHub target.", undefined, true);
+      const read = readPullRequest(repository, number, rt.location.repoRoot ?? ctx.cwd);
+      if (!read.ok) return textResult(`Cannot enter review wait: ${read.reason}.`, undefined, true);
+      const pr = read.pull_request;
+      if (pr.state !== "open") return textResult(`Cannot enter review wait: PR #${number} is ${pr.state}, not open.`, undefined, true);
+      if (pr.repository.toLowerCase() !== repository.toLowerCase()) return textResult("Cannot enter review wait: PR base repository does not match the mission remote.", undefined, true);
+      if (pr.branch !== rt.facts.branch || pr.head_sha !== rt.facts.head_sha || pr.branch !== job.repo.branch || pr.head_sha !== job.repo.current_sha) {
+        return textResult(`Cannot enter review wait: live PR ${pr.branch}@${pr.head_sha.slice(0, 12)} does not exactly match mission checkout ${rt.facts.branch}@${rt.facts.head_sha.slice(0, 12)}. Checkpoint or reconcile the current head first.`, undefined, true);
+      }
+      try {
+        const waiting = applyReviewWait(job, {
+          repository,
+          pull_request: pr.number,
+          url: pr.url,
+          branch: pr.branch,
+          head_sha: pr.head_sha,
+          worker_session_id: sessionId,
+          requested_review: requestedReview as "general" | "approval" | "correction",
+        });
+        if (waiting !== job) {
+          writeJob(rt.location, waiting);
+          appendEvent(rt.location, "review-wait", { job_id: waiting.job_id, repository, pull_request: pr.number, branch: pr.branch, head_sha: pr.head_sha, worker_session_id: sessionId });
+          safeNotify(ctx, `studio: waiting for review · PR #${pr.number} @ ${pr.head_sha.slice(0, 7)}`, "info");
+        }
+        updateStatus(ctx, waiting, rt.config);
+        return textResult(`WAITING_REVIEW: ${repository} PR #${pr.number} ${pr.branch}@${pr.head_sha}. Automatic continuation is stopped until an authorized decision is validated.`, { job_id: waiting.job_id, worker_session_id: sessionId, repository, pull_request: pr.number, head_sha: pr.head_sha });
+      } catch (error) {
+        return textResult(`Cannot enter review wait: ${error instanceof Error ? error.message : String(error)}`, undefined, true);
+      }
+    },
+  });
   pi.registerTool({
     name: "studio_checkpoint",
     label: "Studio checkpoint",
