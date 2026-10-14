@@ -276,9 +276,11 @@ export function readReviewDelivery(loc: LedgerLocation, deliveryId: string): Rev
   try {
     const delivery = JSON.parse(fs.readFileSync(deliveryPath(loc, loc.workerId, deliveryId), "utf8")) as ReviewDelivery;
     if (delivery.worker_session_id !== loc.workerId || delivery.id !== deliveryId) return undefined;
-    // Deliveries queued before reviewer-authority tracking default to the
-    // previous behavior; anything else unknown fails closed.
-    if (delivery.authority === undefined) delivery.authority = "independent";
+    // Receipts queued before reviewer-authority tracking carry no proof of
+    // an independent reviewer identity, so they are never promoted to one:
+    // they park for Matthew like any other same-account feedback. Anything
+    // else unknown fails closed and is unreadable.
+    if (delivery.authority === undefined) delivery.authority = "same-account";
     if (delivery.authority !== "independent" && delivery.authority !== "same-account") return undefined;
     return delivery;
   } catch { return undefined; }
@@ -348,10 +350,23 @@ export function acknowledgeReview(loc: LedgerLocation, deliveryId: string, cwd: 
     writeJob(loc, updated);
     return { ok: true, reason: "review acknowledged; mission resumed without merge authority", job: updated };
   }
-  if (delivery.decision === "hold" && job.status === "WAITING_REVIEW") {
+  // A hold is never silently ignored or stranded: every hold receipt is
+  // marked acknowledged exactly once. The last independent decision governs:
+  // a later hold re-pauses work an earlier decision resumed. Same-account
+  // holds are recorded only; Matthew's direction still governs them.
+  if (delivery.decision === "hold" && delivery.state === "pending") {
     delivery.state = "acknowledged";
     delivery.acknowledged_at = now;
     writeAtomic(deliveryPath(loc, loc.workerId, deliveryId), delivery);
+    if (delivery.authority !== "independent") {
+      return { ok: true, reason: "same-account hold recorded; Matthew's direction still governs", job };
+    }
+    if (job.status === "WORKING") {
+      const paused = applyTransition(job, "WAITING_REVIEW");
+      const updated: JobState = { ...paused, continuation: { ...job.continuation, allowed: false, reason: "authorized review hold after resumption" }, updated_at: now };
+      writeJob(loc, updated);
+      return { ok: true, reason: "hold acknowledged; mission re-paused awaiting reviewer", job: updated };
+    }
     return { ok: true, reason: "hold acknowledged; mission remains WAITING_REVIEW", job };
   }
   if (delivery.state === "acknowledged" && delivery.authority === "same-account") return { ok: true, reason: "same-account feedback was already recorded; Matthew's direction still governs", job };

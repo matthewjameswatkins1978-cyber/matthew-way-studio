@@ -20,14 +20,14 @@ import type {
 } from "../src/pi-shim.js";
 import { customMessage, textResult } from "../src/pi-shim.js";
 import { ledgerLocation, run, type LedgerLocation } from "../src/paths.js";
-import { adoptLegacyJob, appendEvent, readJob, writeJob, readPacket, type JobReadResult } from "../src/ledger.js";
+import { adoptLegacyJob, appendEvent, readJob, readLegacySnapshot, writeJob, readPacket, type JobReadResult } from "../src/ledger.js";
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
 import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyMemory, applyReviewWait, applyReviewWaitRecovery, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
 import { acknowledgeReview, importReviewComment, listPendingReviews, readPullRequest, readReviewDelivery } from "../src/review.js";
 import { discoverLanternTools, lanternContextResult, readSnapshot } from "../src/lantern.js";
-import { isSubstantivePacket, detectControlIntent, detectReviewRecoveryIntent } from "../src/packet.js";
+import { isSubstantivePacket, detectControlIntent, detectLegacyAdoptionIntent, detectReviewRecoveryIntent } from "../src/packet.js";
 import { renderMissionBrief, renderNeedsHuman, renderReceipt } from "../src/receipt.js";
 import { canTransition, progressSignature, terminalStatus, type BlockerKind, type JobState } from "../src/schema.js";
 import { renderRuleSnapshot } from "../src/rules.js";
@@ -227,6 +227,28 @@ export function registerStudio(pi: PiApi): void {
     if (rt.config.requireProjectTrust && !trusted(ctx)) {
       withSection(event, "STUDIO: project is not trusted; the packet runtime is idle for this folder.");
       return undefined;
+    }
+
+    // Human-authorised legacy adoption only: Matthew names the exact legacy
+    // job id in his own message, in the session that should own it. The job
+    // id is readable from the shared snapshot, so knowledge of it authorises
+    // nothing — the boundary is authorship of a user-originated turn in the
+    // adopting session. No model-callable tool adopts legacy missions.
+    if (isUserOrigin(event) && rt.location.workerId) {
+      const adoptJobId = detectLegacyAdoptionIntent(prompt);
+      if (adoptJobId) {
+        const result = adoptLegacyJob(rt.location, adoptJobId);
+        if (!result.ok) {
+          safeNotify(ctx, `studio: legacy adoption refused — ${result.reason}.`, "warning");
+          withSection(event, `STUDIO: legacy adoption refused — ${result.reason}. The legacy snapshot was left untouched.`);
+        } else {
+          appendEvent(rt.location, "legacy-adopted", { job_id: result.job.job_id, status: result.job.status, human_authorised: true });
+          updateStatus(ctx, result.job, rt.config);
+          safeNotify(ctx, `studio: adopted legacy mission ${result.job.job_id} (${result.job.status}) into this session.`, "info");
+          withSection(event, missionSection(result.job, rt.config));
+        }
+        return undefined;
+      }
     }
 
     if (job?.status === "WAITING_REVIEW") {
@@ -524,23 +546,6 @@ export function registerStudio(pi: PiApi): void {
       if (pending.length === 0) return textResult("No pending reviews for this session.", { count: 0 });
       const lines = pending.map((p) => `- ${p.id} · ${p.decision} from @${p.author} · PR #${p.pull_request} @ ${p.head_sha.slice(0, 12)} · queued ${p.created_at}${p.authority === "same-account" ? " · same-account feedback (parks for Matthew, never auto-resumes)" : ""}`);
       return textResult([`${pending.length} pending review(s) for this session. Call studio_receive_review with an ID, then studio_ack_review.`, ...lines].join("\n"), { count: pending.length, deliveries: pending.map((p) => p.id) });
-    },
-  });
-  pi.registerTool({
-    name: "studio_adopt_legacy",
-    label: "Studio adopt legacy mission",
-    description: "Explicitly adopt the legacy shared mission snapshot into this Pi session's isolated ledger. Requires the exact legacy job id supplied by Matthew, preserves the legacy file verbatim, and refuses when another worker already adopted it or this session already has a mission. Never runs automatically.",
-    parameters: Type.Object({
-      job_id: Type.String({ description: "Exact legacy job id to adopt" }),
-    }),
-    execute: async (_id, params, _signal, _update, ctx) => {
-      const rt = runtimeFor(ctx);
-      if (!rt.location.workerId) return textResult("Adoption needs a Pi session with a stable session ID.", undefined, true);
-      const result = adoptLegacyJob(rt.location, str(params["job_id"]) ?? "");
-      if (!result.ok) return textResult(`Legacy adoption refused: ${result.reason}.`, undefined, true);
-      appendEvent(rt.location, "legacy-adopted", { job_id: result.job.job_id, status: result.job.status });
-      updateStatus(ctx, result.job, rt.config);
-      return textResult(`Adopted legacy mission ${result.job.job_id} (${result.job.status}) into this session. The legacy snapshot was preserved.`, { job_id: result.job.job_id, status: result.job.status });
     },
   });
   pi.registerTool({
@@ -933,9 +938,17 @@ export function registerStudio(pi: PiApi): void {
       const job = jobOf(rt);
       if (!job) {
         const warn = describeUnreadable(rt.read, rt.location.dir);
+        // Discoverability for the one-time migration: a legacy snapshot is
+        // reported, but only Matthew himself can adopt it, in his own
+        // message, in the session that should own it. No tool adopts it.
+        const legacy = readLegacySnapshot(rt.location);
+        const legacyHint = legacy.kind === "loaded" && rt.location.workerId
+          ? `legacy snapshot: ${legacy.job.job_id} (${legacy.job.status}). To adopt it into THIS session, say: adopt legacy job ${legacy.job.job_id}`
+          : "legacy snapshot: none";
         return textResult(
           [
             warn ?? "No active Studio mission.",
+            legacyHint,
             `ledger: ${rt.location.dir} (${rt.location.source})`,
             `branch: ${rt.facts.branch || "(none)"} @ ${rt.facts.head_sha.slice(0, 10) || "(no commits)"}`,
             `dirty: ${rt.facts.dirty ? `${rt.facts.dirty_paths.length} path(s)` : "no"}`,
@@ -1057,12 +1070,12 @@ function safeToolList(ctx: PiToolContext): { name: string }[] {
 
 /**
  * Pi 1.2.0 origin check. before_agent_start fires for user messages and for
- * idle custom triggerTurn messages; only a genuine user message may release
- * a review wait or adopt a legacy mission. Older harnesses omit the field
- * and are treated as user-originated.
+ * idle custom triggerTurn messages; only an explicitly verified user message
+ * may release a review wait or adopt a legacy mission. Missing, older, or
+ * unexpected origins fail closed: they are never treated as Matthew.
  */
 function isUserOrigin(event: PiBeforeAgentStartEvent): boolean {
-  return event.messageType !== "custom";
+  return event.messageType === "user";
 }
 
 /**

@@ -108,7 +108,7 @@ function waitingJob(dir: string, sessionId: string): void {
   writeJob(loc, { ...wait, worker_session_id: sessionId });
 }
 
-function agentStart(prompt: string, messageType?: "user" | "custom"): PiBeforeAgentStartEvent {
+function agentStart(prompt: string, messageType?: string): PiBeforeAgentStartEvent {
   return { type: "before_agent_start", prompt, systemPrompt: "", systemPromptOptions: {}, ...(messageType ? { messageType } : {}) } as PiBeforeAgentStartEvent;
 }
 
@@ -178,6 +178,25 @@ test("custom messages, vague continuations, and other workers never release the 
   assert.ok(harness.notifications.some((n) => n.includes("another Pi session")));
 });
 
+test("missing or unknown message origin fails closed and never recovers the wait", async () => {
+  const dir = tempRepo();
+  waitingJob(dir, "worker-1");
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ownerCtx = ctxFor(dir, harness, "worker-1");
+  const status = () => readJob(ledgerLocation(dir, "worker-1"));
+
+  await emit(harness, "before_agent_start", agentStart("cancel review wait"), ownerCtx);
+  assert.equal((status() as any).job.status, "WAITING_REVIEW", "absent origin is not Matthew");
+
+  await emit(harness, "before_agent_start", agentStart("cancel review wait", "intruder"), ownerCtx);
+  assert.equal((status() as any).job.status, "WAITING_REVIEW", "unknown origin is not Matthew");
+
+  await emit(harness, "before_agent_start", agentStart("adopt legacy job job-x"), ownerCtx);
+  assert.equal((status() as any).job.status, "WAITING_REVIEW", "absent origin adopts nothing");
+  assert.equal(harness.notifications.length, 0, "failed-closed turns stay silent");
+});
+
 test("restart announces the pending inbox with exact IDs and the worker receives it", async () => {
   const dir = tempRepo();
   waitingJob(dir, "worker-1");
@@ -213,7 +232,7 @@ test("restart announces the pending inbox with exact IDs and the worker receives
   assert.equal(after.kind === "loaded" && after.job.repo.branch, "feature/review", "acknowledgement never merges or moves branches");
 });
 
-test("legacy missions are never auto-claimed; studio_adopt_legacy is explicit and preserving", async () => {
+test("legacy missions are never auto-claimed; only Matthew's own message adopts", async () => {
   const dir = tempRepo();
   const legacy = newJob({
     jobId: "job-legacy-harness",
@@ -225,19 +244,31 @@ test("legacy missions are never auto-claimed; studio_adopt_legacy is explicit an
   writeJob(ledgerLocation(dir), legacy);
   const harness = makeHarness();
   registerStudio(harness.api);
+  assert.equal(harness.tools.has("studio_adopt_legacy"), false, "no model-callable adoption tool exists");
   const ctx = ctxFor(dir, harness, "worker-9");
 
   await emit(harness, "before_agent_start", agentStart("thanks", "user"), ctx);
   assert.deepEqual(readJob(ledgerLocation(dir, "worker-9")), { kind: "none" }, "an unrelated session never inherits the mission");
 
-  const wrong = await harness.tools.get("studio_adopt_legacy")!.execute("a1", { job_id: "job-nope" }, undefined, undefined, ctx);
-  assert.equal(wrong.isError, true);
+  // A model/custom message naming the id authorises nothing.
+  await emit(harness, "before_agent_start", agentStart("adopt legacy job job-legacy-harness", "custom"), ctx);
+  assert.deepEqual(readJob(ledgerLocation(dir, "worker-9")), { kind: "none" }, "a custom message cannot adopt");
 
-  const adopted = await harness.tools.get("studio_adopt_legacy")!.execute("a2", { job_id: "job-legacy-harness" }, undefined, undefined, ctx);
-  assert.match(adopted.content[0]?.text ?? "", /Adopted legacy mission job-legacy-harness/);
+  // Matthew naming the wrong id is refused and preserves the snapshot.
+  await emit(harness, "before_agent_start", agentStart("adopt legacy job job-nope", "user"), ctx);
+  assert.deepEqual(readJob(ledgerLocation(dir, "worker-9")), { kind: "none" });
+  assert.ok(harness.notifications.some((n) => n.includes("refused")));
+
+  // Matthew's own message in the owning session adopts exactly once.
+  await emit(harness, "before_agent_start", agentStart("adopt legacy job job-legacy-harness", "user"), ctx);
   const owned = readJob(ledgerLocation(dir, "worker-9"));
   assert.equal(owned.kind === "loaded" && owned.job.worker_session_id, "worker-9");
   const key = createHash("sha256").update("worker-9").digest("hex").slice(0, 24);
   assert.equal(fs.existsSync(path.join(ledgerLocation(dir).dir, "active-job.json")), true, "legacy snapshot preserved");
   assert.equal(fs.existsSync(path.join(ledgerLocation(dir).dir, `active-job.${key}.json`)), true, "scoped copy written");
+  assert.ok(harness.notifications.some((n) => n.includes("job-legacy-harness")));
+
+  // A second session naming the same id is refused: single winner.
+  await emit(harness, "before_agent_start", agentStart("adopt legacy job job-legacy-harness", "user"), ctxFor(dir, harness, "worker-10"));
+  assert.deepEqual(readJob(ledgerLocation(dir, "worker-10")), { kind: "none" });
 });

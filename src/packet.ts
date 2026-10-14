@@ -255,3 +255,20 @@ export function detectReviewRecoveryIntent(text: string): "resume" | "park" | un
   if (lower === "resume the mission" || /\bresume the mission\b[^.\n]{0,40}\breview\b/i.test(trimmed)) return "resume";
   return undefined;
 }
+
+/**
+ * Explicit human approval to adopt the legacy shared mission into this
+ * session's isolated ledger. The vocabulary is deliberately narrow — the
+ * words adopt + legacy + an exact job id — and only a user-originated turn
+ * may invoke it (the extension gates on the Pi 1.2.0 message origin). The
+ * job id itself is not a secret: it is readable from the shared snapshot,
+ * so the boundary is Matthew's authorship of the message in the owning
+ * session, not knowledge of the identifier. Returns the named job id.
+ */
+export function detectLegacyAdoptionIntent(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 400) return undefined;
+  if (!/\badopt\b/i.test(trimmed) || !/\blegacy\b/i.test(trimmed)) return undefined;
+  const match = /\b(job-[A-Za-z0-9-]{1,80})\b/.exec(trimmed);
+  return match?.[1];
+}
