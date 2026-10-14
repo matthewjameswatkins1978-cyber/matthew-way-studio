@@ -7,6 +7,7 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -64,19 +65,25 @@ export interface LedgerLocation {
   /** Where the ledger came from, for receipts and debugging. */
   source: "git-common-dir" | "git-dir" | "fallback";
   repoRoot?: string;
+  /** Stable Pi session identity when this location is worker-scoped. */
+  workerId?: string;
+  workerKey?: string;
 }
 
-export function ledgerLocation(cwd: string): LedgerLocation {
+export function ledgerLocation(cwd: string, workerId?: string): LedgerLocation {
   const root = repoRoot(cwd);
   const common = root ? gitCommonDir(root) : undefined;
+  let base: LedgerLocation;
   if (root && common) {
-    return { dir: path.join(common, LEDGER_DIR_NAME), source: "git-common-dir", repoRoot: root };
-  }
-  if (root) {
+    base = { dir: path.join(common, LEDGER_DIR_NAME), source: "git-common-dir", repoRoot: root };
+  } else if (root) {
     // Unusual: a repo whose common dir cannot be resolved. Stay inside the repo.
-    return { dir: path.join(root, ".git", LEDGER_DIR_NAME), source: "git-dir", repoRoot: root };
+    base = { dir: path.join(root, ".git", LEDGER_DIR_NAME), source: "git-dir", repoRoot: root };
+  } else {
+    base = { dir: path.join(cwd, ".pi", LEDGER_DIR_NAME), source: "fallback" };
   }
-  return { dir: path.join(cwd, ".pi", LEDGER_DIR_NAME), source: "fallback" };
+  if (!workerId?.trim()) return base;
+  return { ...base, workerId, workerKey: createHash("sha256").update(workerId).digest("hex").slice(0, 24) };
 }
 
 /** Ledger paths are created on demand; reading never mutates the repository. */

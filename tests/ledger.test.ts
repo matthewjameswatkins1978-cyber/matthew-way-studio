@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { ledgerLocation } from "../src/paths.js";
 import {
   ACTIVE_JOB_FILE,
+  activeJobPath,
   appendEvent,
   clearJob,
   makeJobId,
@@ -111,4 +113,31 @@ test("job ids are stable for the same mission seed", () => {
   const b = makeJobId("root:main:sha:objective");
   assert.equal(a, b);
   assert.notEqual(a, makeJobId("root:main:sha:other"));
+});
+
+test("linked Pi workers get isolated ledgers and cannot read each other's active job", () => {
+  const base = tempLocation();
+  const worker = (id: string) => ({ ...base, workerId: id, workerKey: createHash("sha256").update(id).digest("hex").slice(0, 24) });
+  const a = worker("session-a");
+  const b = worker("session-b");
+  writeJob(a, { ...job("job-a"), worker_session_id: a.workerId });
+  writeJob(b, { ...job("job-b"), worker_session_id: b.workerId });
+  const readA = readJob(a);
+  const readB = readJob(b);
+  assert.equal(readA.kind === "loaded" ? readA.job.job_id : undefined, "job-a");
+  assert.equal(readB.kind === "loaded" ? readB.job.job_id : undefined, "job-b");
+  assert.notEqual(path.basename(activeJobPath(a)), path.basename(activeJobPath(b)));
+});
+
+test("legacy shared job is adopted by only one worker and remains recoverable", () => {
+  const base = tempLocation();
+  const worker = (id: string) => ({ ...base, workerId: id, workerKey: createHash("sha256").update(id).digest("hex").slice(0, 24) });
+  writeJob(base, job("job-legacy"));
+  const a = worker("legacy-owner");
+  const b = worker("legacy-contender");
+  const adopted = readJob(a);
+  assert.equal(adopted.kind === "loaded" && adopted.job.worker_session_id, "legacy-owner");
+  assert.deepEqual(readJob(b), { kind: "none" });
+  assert.equal(readJob(a).kind, "loaded", "the winning worker resumes its scoped copy after restart");
+  assert.equal(fs.existsSync(path.join(base.dir, ACTIVE_JOB_FILE)), true, "the original shared snapshot is preserved");
 });

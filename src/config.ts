@@ -22,6 +22,8 @@ export interface StudioConfig extends ContinuationLimits {
    * Declare repo integration targets here.
    */
   protectedBranches?: string[];
+  /** Exact GitHub logins allowed to authorize Studio review decisions. Empty fails closed. */
+  authorizedReviewers: string[];
 }
 
 export const DEFAULT_CONFIG: StudioConfig = {
@@ -29,6 +31,7 @@ export const DEFAULT_CONFIG: StudioConfig = {
   minPacketChars: 320,
   autoContinue: true,
   requireProjectTrust: true,
+  authorizedReviewers: [],
   // Workshop default: the read-only lantern-git mirror snapshot. Absent or
   // stale is reported as unavailable, never treated as repository truth.
   lanternMirror: { mirrorPath: "D:/Projects/lantern-git/mirror", maxAgeMinutes: 24 * 60 },
@@ -65,6 +68,9 @@ export function mergeConfig(base: StudioConfig, raw: Partial<StudioConfig>): Stu
     protectedBranches: Array.isArray(raw.protectedBranches)
       ? raw.protectedBranches.filter((b): b is string => typeof b === "string" && b.trim().length > 0).slice(0, 32)
       : base.protectedBranches,
+    authorizedReviewers: Array.isArray(raw.authorizedReviewers)
+      ? [...new Set(raw.authorizedReviewers.filter((v): v is string => typeof v === "string" && /^[A-Za-z0-9-]{1,39}$/.test(v)))].slice(0, 32)
+      : base.authorizedReviewers,
     lanternMirror: raw.lanternMirror?.mirrorPath ? { mirrorPath: raw.lanternMirror.mirrorPath, maxAgeMinutes: raw.lanternMirror.maxAgeMinutes } : base.lanternMirror,
   };
 }

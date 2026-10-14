@@ -23,15 +23,37 @@ export type JobReadResult =
   | { kind: "future-version"; reason: string };
 
 export function activeJobPath(loc: LedgerLocation): string {
-  return path.join(loc.dir, ACTIVE_JOB_FILE);
+  return path.join(loc.dir, loc.workerKey ? `active-job.${loc.workerKey}.json` : ACTIVE_JOB_FILE);
 }
 
 export function eventsPath(loc: LedgerLocation): string {
-  return path.join(loc.dir, EVENTS_FILE);
+  return path.join(loc.dir, loc.workerKey ? `events.${loc.workerKey}.jsonl` : EVENTS_FILE);
 }
 
 export function packetDir(loc: LedgerLocation, jobId: string): string {
-  return path.join(loc.dir, "jobs", jobId);
+  return path.join(loc.dir, "jobs", ...(loc.workerKey ? [loc.workerKey] : []), jobId);
+}
+
+function claimLegacyJob(loc: LedgerLocation, job: JobState): boolean {
+  if (!loc.workerId || !loc.workerKey) return false;
+  if (job.worker_session_id && job.worker_session_id !== loc.workerId) return false;
+  if (job.review_wait && job.review_wait.worker_session_id !== loc.workerId) return false;
+  const claimDir = path.join(loc.dir, "legacy-claims");
+  ensureDir(claimDir);
+  const claim = path.join(claimDir, `${createHash("sha256").update(job.job_id).digest("hex")}.json`);
+  const value = { job_id: job.job_id, worker_session_id: loc.workerId };
+  try {
+    const fd = fs.openSync(claim, "wx");
+    try { fs.writeFileSync(fd, `${JSON.stringify(value)}\n`, "utf8"); } finally { fs.closeSync(fd); }
+    return true;
+  } catch {
+    try {
+      const prior = JSON.parse(fs.readFileSync(claim, "utf8")) as Record<string, unknown>;
+      return prior.job_id === job.job_id && prior.worker_session_id === loc.workerId;
+    } catch {
+      return false;
+    }
+  }
 }
 
 /**
@@ -41,7 +63,17 @@ export function packetDir(loc: LedgerLocation, jobId: string): string {
  */
 export function readJob(loc: LedgerLocation): JobReadResult {
   const file = activeJobPath(loc);
-  if (!fs.existsSync(file)) return { kind: "none" };
+  if (!fs.existsSync(file)) {
+    // One-time, single-winner adoption of the old shared snapshot. Keep the
+    // source intact so a failed migration is recoverable and other workers
+    // cannot silently inherit the same job.
+    if (!loc.workerKey) return { kind: "none" };
+    const legacy = readJob({ ...loc, workerId: undefined, workerKey: undefined });
+    if (legacy.kind !== "loaded" || !claimLegacyJob(loc, legacy.job)) return { kind: "none" };
+    const owned = { ...legacy.job, worker_session_id: loc.workerId };
+    writeJob(loc, owned);
+    return { kind: "loaded", job: owned };
+  }
   let text: string;
   try {
     text = fs.readFileSync(file, "utf8");
@@ -56,7 +88,9 @@ export function readJob(loc: LedgerLocation): JobReadResult {
     return { kind: "corrupt", reason: `invalid JSON: ${String(error)}` };
   }
   try {
-    return { kind: "loaded", job: normalizeJob(raw) };
+    const job = normalizeJob(raw);
+    if (loc.workerId && job.worker_session_id && job.worker_session_id !== loc.workerId) return { kind: "none" };
+    return { kind: "loaded", job };
   } catch (error) {
     if (error instanceof JobParseError) {
       const future = /newer than runtime/.test(error.message);
@@ -91,6 +125,9 @@ export interface WriteOptions {
 }
 
 export function writeJob(loc: LedgerLocation, job: JobState, options: WriteOptions = {}): string {
+  if (loc.workerId && job.worker_session_id && loc.workerId !== job.worker_session_id) {
+    throw new Error("refusing to write another Pi worker's mission");
+  }
   const file = activeJobPath(loc);
   if (options.backup && fs.existsSync(file)) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");

@@ -91,6 +91,7 @@ export function startMission(input: {
   return {
     schema_version: SCHEMA_VERSION,
     job_id: jobId,
+    ...(input.location.workerId ? { worker_session_id: input.location.workerId } : {}),
     status: "WORKING",
     ...contract,
     repo: {

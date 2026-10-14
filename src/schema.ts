@@ -149,6 +149,8 @@ export interface ReviewWaitTarget {
 export interface JobState extends JobContract {
   schema_version: number;
   job_id: string;
+  /** The Pi session that owns this mission; prevents shared-worktree state bleed. */
+  worker_session_id?: string;
   status: JobStatus;
   repo: JobRepo;
   progress: JobProgress;
@@ -286,6 +288,7 @@ export function normalizeJob(raw: unknown): JobState {
   const job: JobState = {
     schema_version: SCHEMA_VERSION,
     job_id: str(obj.job_id) || `job-${Date.now().toString(36)}`,
+    ...(typeof obj.worker_session_id === "string" && obj.worker_session_id ? { worker_session_id: obj.worker_session_id } : {}),
     status,
     ...(obj.review_wait === undefined ? {} : { review_wait: normalizeReviewWait(obj.review_wait) }),
     objective: str(obj.objective),
