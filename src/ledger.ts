@@ -34,26 +34,57 @@ export function packetDir(loc: LedgerLocation, jobId: string): string {
   return path.join(loc.dir, "jobs", ...(loc.workerKey ? [loc.workerKey] : []), jobId);
 }
 
-function claimLegacyJob(loc: LedgerLocation, job: JobState): boolean {
-  if (!loc.workerId || !loc.workerKey) return false;
-  if (job.worker_session_id && job.worker_session_id !== loc.workerId) return false;
-  if (job.review_wait && job.review_wait.worker_session_id !== loc.workerId) return false;
-  const claimDir = path.join(loc.dir, "legacy-claims");
+/**
+ * Read the legacy shared snapshot without claiming it. Worker-scoped reads
+ * never consult the legacy file: an unrelated Pi session must not
+ * automatically inherit another worker's in-flight mission. Explicit,
+ * opt-in adoption is the only path (see adoptLegacyJob).
+ */
+export function readLegacySnapshot(loc: LedgerLocation): JobReadResult {
+  return readJob({ ...loc, workerId: undefined, workerKey: undefined });
+}
+
+export type LegacyAdoption =
+  | { ok: true; job: JobState }
+  | { ok: false; reason: string };
+
+/**
+ * Explicitly adopt the legacy shared snapshot into this worker's scoped file.
+ * The caller must name the exact expected job id out of band (Matthew tells
+ * the owning worker; nothing is inferred from the shared directory). The
+ * legacy file is preserved verbatim so a failed migration stays recoverable.
+ * Single-winner: a second worker adopting the same legacy job is refused.
+ */
+export function adoptLegacyJob(loc: LedgerLocation, expectedJobId: string): LegacyAdoption {
+  if (!loc.workerId || !loc.workerKey) return { ok: false, reason: "adoption needs a worker-scoped ledger location" };
+  if (!expectedJobId.trim()) return { ok: false, reason: "adoption needs the exact legacy job id" };
+  const legacy = readLegacySnapshot(loc);
+  if (legacy.kind !== "loaded") return { ok: false, reason: "no adoptable legacy mission snapshot" };
+  if (legacy.job.job_id !== expectedJobId) return { ok: false, reason: "legacy job id does not match the expected mission" };
+  if (legacy.job.worker_session_id && legacy.job.worker_session_id !== loc.workerId) {
+    return { ok: false, reason: "legacy mission already belongs to another worker" };
+  }
+  if (fs.existsSync(activeJobPath(loc))) return { ok: false, reason: "this worker already has an active mission" };
+  const claimDir = path.join(loc.dir, "legacy-adoptions");
   ensureDir(claimDir);
-  const claim = path.join(claimDir, `${createHash("sha256").update(job.job_id).digest("hex")}.json`);
-  const value = { job_id: job.job_id, worker_session_id: loc.workerId };
+  const claim = path.join(claimDir, `${createHash("sha256").update(legacy.job.job_id).digest("hex")}.json`);
+  const value = { job_id: legacy.job.job_id, worker_session_id: loc.workerId, at: new Date().toISOString() };
   try {
     const fd = fs.openSync(claim, "wx");
     try { fs.writeFileSync(fd, `${JSON.stringify(value)}\n`, "utf8"); } finally { fs.closeSync(fd); }
-    return true;
   } catch {
     try {
       const prior = JSON.parse(fs.readFileSync(claim, "utf8")) as Record<string, unknown>;
-      return prior.job_id === job.job_id && prior.worker_session_id === loc.workerId;
+      if (prior.job_id !== legacy.job.job_id || prior.worker_session_id !== loc.workerId) {
+        return { ok: false, reason: "legacy mission was already adopted by another worker" };
+      }
     } catch {
-      return false;
+      return { ok: false, reason: "legacy adoption record is unreadable" };
     }
   }
+  const owned = { ...legacy.job, worker_session_id: loc.workerId };
+  writeJob(loc, owned);
+  return { ok: true, job: owned };
 }
 
 /**
@@ -63,17 +94,7 @@ function claimLegacyJob(loc: LedgerLocation, job: JobState): boolean {
  */
 export function readJob(loc: LedgerLocation): JobReadResult {
   const file = activeJobPath(loc);
-  if (!fs.existsSync(file)) {
-    // One-time, single-winner adoption of the old shared snapshot. Keep the
-    // source intact so a failed migration is recoverable and other workers
-    // cannot silently inherit the same job.
-    if (!loc.workerKey) return { kind: "none" };
-    const legacy = readJob({ ...loc, workerId: undefined, workerKey: undefined });
-    if (legacy.kind !== "loaded" || !claimLegacyJob(loc, legacy.job)) return { kind: "none" };
-    const owned = { ...legacy.job, worker_session_id: loc.workerId };
-    writeJob(loc, owned);
-    return { kind: "loaded", job: owned };
-  }
+  if (!fs.existsSync(file)) return { kind: "none" };
   let text: string;
   try {
     text = fs.readFileSync(file, "utf8");

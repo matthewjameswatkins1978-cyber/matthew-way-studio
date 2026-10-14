@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { acknowledgeReview, importReviewComment, parseReviewEnvelope, readReviewDelivery, type PullRequestSnapshot, type ReviewComment } from "../src/review.js";
+import { acknowledgeReview, importReviewComment, listPendingReviews, parseReviewEnvelope, readReviewDelivery, type PullRequestSnapshot, type ReviewComment } from "../src/review.js";
 import { writeJob, readJob } from "../src/ledger.js";
 import type { LedgerLocation } from "../src/paths.js";
 import { applyReviewWait } from "../src/mission.js";
@@ -48,10 +48,10 @@ function pullRequest(headSha = HEAD): PullRequestSnapshot {
   return { repository: REPOSITORY, number: 35, state: "open", url: "https://github.com/owner/repo/pull/35", branch: "feature/review", head_sha: headSha };
 }
 
-function importer(dir: string, commentValue: ReviewComment, headSha = HEAD, worker = "importer-session") {
+function importer(dir: string, commentValue: ReviewComment, headSha = HEAD, worker = "importer-session", extra: { workerGithubLogins?: string[]; allowSameAccountReviews?: boolean } = {}) {
   return importReviewComment({
     location: location(dir, worker), repository: REPOSITORY, commentId: commentValue.id,
-    authorizedReviewers: ["Lucy-Reviewer"], cwd: dir, now: Date.parse("2026-10-14T12:00:00.000Z"),
+    authorizedReviewers: ["Lucy-Reviewer"], workerGithubLogins: extra.workerGithubLogins, allowSameAccountReviews: extra.allowSameAccountReviews, cwd: dir, now: Date.parse("2026-10-14T12:00:00.000Z"),
     readComment: () => commentValue,
     readPullRequest: () => ({ ok: true, pull_request: pullRequest(headSha) }),
   });
@@ -82,9 +82,18 @@ test("review import queues for the exact owner worker; restart and duplicates ar
   const restartedOwner = location(dir, WORKER);
   assert.equal(readReviewDelivery(restartedOwner, first.delivery.id)?.body, "Please address the two review findings.");
   assert.equal(readReviewDelivery(location(dir, "wrong-worker"), first.delivery.id), undefined);
-  const sameDecision = comment(9005);
-  const duplicateDecision = importer(dir, sameDecision);
-  assert.equal(duplicateDecision.ok && duplicateDecision.duplicate, true, "a second comment cannot execute the same decision twice for one job/head");
+  const secondFinding = comment(9005);
+  const queued = importer(dir, secondFinding);
+  assert.equal(queued.ok, true);
+  if (!first.ok || !queued.ok) return;
+  assert.equal(queued.duplicate, false, "a second comment with different feedback is its own delivery");
+  assert.notEqual(queued.delivery.id, first.delivery.id, "event identity is preserved per GitHub comment");
+  assert.equal(listPendingReviews(restartedOwner).length, 2, "both findings wait in the owner inbox");
+  const accepted = acknowledgeReview(restartedOwner, first.delivery.id, dir, "2026-10-14T12:31:00.000Z", () => ({ ok: true, pull_request: pullRequest() }));
+  assert.equal(accepted.ok, true);
+  const followUp = acknowledgeReview(location(dir, WORKER), queued.delivery.id, dir, "2026-10-14T12:32:00.000Z", () => ({ ok: true, pull_request: pullRequest() }));
+  assert.equal(followUp.ok, true, "acknowledging the second finding after resumption is harmless and records it");
+  assert.equal(listPendingReviews(location(dir, WORKER)).length, 0, "the inbox drains as each delivery is acknowledged");
 });
 
 test("unauthorized, free-form, wrong-target and stale-head comments fail closed", () => {

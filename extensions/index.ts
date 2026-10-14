@@ -19,15 +19,15 @@ import type {
   PiToolContext,
 } from "../src/pi-shim.js";
 import { customMessage, textResult } from "../src/pi-shim.js";
-import { ledgerLocation, type LedgerLocation } from "../src/paths.js";
-import { appendEvent, readJob, writeJob, readPacket, type JobReadResult } from "../src/ledger.js";
+import { ledgerLocation, run, type LedgerLocation } from "../src/paths.js";
+import { adoptLegacyJob, appendEvent, readJob, writeJob, readPacket, type JobReadResult } from "../src/ledger.js";
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
-import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyMemory, applyReviewWait, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
-import { acknowledgeReview, importReviewComment, readPullRequest, readReviewDelivery } from "../src/review.js";
+import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyMemory, applyReviewWait, applyReviewWaitRecovery, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
+import { acknowledgeReview, importReviewComment, listPendingReviews, readPullRequest, readReviewDelivery } from "../src/review.js";
 import { discoverLanternTools, lanternContextResult, readSnapshot } from "../src/lantern.js";
-import { isSubstantivePacket, detectControlIntent } from "../src/packet.js";
+import { isSubstantivePacket, detectControlIntent, detectReviewRecoveryIntent } from "../src/packet.js";
 import { renderMissionBrief, renderNeedsHuman, renderReceipt } from "../src/receipt.js";
 import { canTransition, progressSignature, terminalStatus, type BlockerKind, type JobState } from "../src/schema.js";
 import { renderRuleSnapshot } from "../src/rules.js";
@@ -106,7 +106,7 @@ function withSection(event: PiBeforeAgentStartEvent, body: string): void {
   event.systemPromptOptions.sections = { ...(event.systemPromptOptions.sections ?? {}), [MISSION_SECTION]: body };
 }
 
-function missionSection(job: JobState, config: StudioConfig): string {
+function missionSection(job: JobState, config: StudioConfig, pendingReviews: { id: string; decision: string; author: string }[] = []): string {
   const brief = renderMissionBrief(job);
   if (job.status === "WAITING_REVIEW") {
     const wait = job.review_wait;
@@ -114,6 +114,10 @@ function missionSection(job: JobState, config: StudioConfig): string {
       brief,
       "",
       `STUDIO WAITING_REVIEW: awaiting an authorized decision on ${wait?.repository ?? "unknown repository"} PR #${wait?.pull_request ?? "?"} at ${wait?.head_sha ?? "unknown SHA"}.`,
+      pendingReviews.length > 0
+        ? `Pending validated reviews for this session: ${pendingReviews.map((p) => `${p.id} (${p.decision} from @${p.author})`).join("; ")}. Call studio_receive_review with an ID, then studio_ack_review — or studio_pending_reviews to list them.`
+        : "No validated reviews are queued for this session yet. Call studio_pending_reviews after a reviewer comments; it lists the inbox without waking extra turns.",
+      "To abandon the wait yourself, say exactly \u201ccancel review wait\u201d to resume working, or \u201cpark the mission\u201d to block for your direction. Only your own message can release this wait; recovery is never reviewer approval, never permission to merge.",
       "This job is durably paused. Do not poll, continue, change its target, or treat ordinary chat as a review decision.",
     ].join("\n");
   }
@@ -202,6 +206,14 @@ export function registerStudio(pi: PiApi): void {
     if (job && job.status === "WORKING") {
       safeNotify(ctx, `studio: resuming mission ${job.job_id} — next: ${job.progress.next_action.slice(0, 90) || job.objective.slice(0, 60)}`, "info");
     }
+    // Inbox discovery on restart: the owner learns its exact pending delivery
+    // IDs without Matthew ferrying them, and without triggering a model turn.
+    if (job && job.status === "WAITING_REVIEW" && rt.location.workerId) {
+      const pending = listPendingReviews(rt.location);
+      if (pending.length > 0) {
+        safeNotify(ctx, `studio: ${pending.length} pending review(s) for this session — ${pending.map((p) => `${p.id} (${p.decision} from @${p.author})`).join(", ")}. Call studio_pending_reviews to read them.`, "info");
+      }
+    }
     if (job && lanternToolNames(pi).length === 0) {
       appendEvent(rt.location, "lantern-tools-absent", { job_id: job.job_id });
     }
@@ -219,7 +231,33 @@ export function registerStudio(pi: PiApi): void {
 
     if (job?.status === "WAITING_REVIEW") {
       updateStatus(ctx, job, rt.config);
-      withSection(event, missionSection(job, rt.config));
+      const pending = rt.location.workerId ? listPendingReviews(rt.location) : [];
+      // Human recovery only: a genuine user message carrying the narrow
+      // recovery vocabulary releases this worker's own wait when the review
+      // channel is dead. Model/custom messages can never release it, vague
+      // continuations ("go ahead") stay quiet, and another worker's job is
+      // never touched. Recovery is a human override, never reviewer approval.
+      if (isUserOrigin(event)) {
+        const recovery = detectReviewRecoveryIntent(prompt);
+        if (recovery) {
+          if (job.worker_session_id && job.worker_session_id !== rt.location.workerId) {
+            safeNotify(ctx, "studio: review wait belongs to another Pi session; refusing to recover it from here.", "warning");
+          } else {
+            try {
+              const recovered = applyReviewWaitRecovery(job, { mode: recovery, reason: prompt.trim().slice(0, 300) });
+              writeJob(rt.location, recovered);
+              appendEvent(rt.location, "review-wait-recovery", { job_id: recovered.job_id, mode: recovery, from: "WAITING_REVIEW", human_override: true });
+              updateStatus(ctx, recovered, rt.config);
+              safeNotify(ctx, `studio: review wait ${recovery === "resume" ? "released by Matthew; resuming as human-directed work (not reviewer approval)" : "parked by Matthew; mission is NEEDS_HUMAN"}.`, recovery === "resume" ? "info" : "warning");
+              withSection(event, missionSection(recovered, rt.config, pending));
+              return undefined;
+            } catch (error) {
+              safeNotify(ctx, `studio: recovery refused — ${error instanceof Error ? error.message : String(error)}`, "warning");
+            }
+          }
+        }
+      }
+      withSection(event, missionSection(job, rt.config, pending));
       return undefined;
     }
     // Ordinary language controls the loop; no ritual commands required.
@@ -441,7 +479,7 @@ export function registerStudio(pi: PiApi): void {
     }),
     execute: async (_id, params, _signal, _update, ctx) => {
       const rt = runtimeFor(ctx);
-      const result = importReviewComment({ location: rt.location, repository: str(params["repository"]) ?? "", commentId: num(params["comment_id"]) ?? 0, authorizedReviewers: rt.config.authorizedReviewers, cwd: ctx.cwd });
+      const result = importReviewComment({ location: rt.location, repository: str(params["repository"]) ?? "", commentId: num(params["comment_id"]) ?? 0, authorizedReviewers: rt.config.authorizedReviewers, workerGithubLogins: workerGithubLoginsFor(rt.config, ctx.cwd), allowSameAccountReviews: rt.config.allowSameAccountReviews, cwd: ctx.cwd });
       if (!result.ok) return textResult(`Review rejected: ${result.reason}.`, undefined, true);
       return textResult(`${result.duplicate ? "Already queued" : "Queued"} ${result.delivery.decision} from @${result.delivery.author} for ${result.delivery.repository} PR #${result.delivery.pull_request} job ${result.delivery.job_id} at ${result.delivery.head_sha}. Delivery is restricted to the owning worker session.`, { delivery_id: result.delivery.id, worker_session_id: result.delivery.worker_session_id, duplicate: result.duplicate });
     },
@@ -449,7 +487,7 @@ export function registerStudio(pi: PiApi): void {
   pi.registerTool({
     name: "studio_receive_review",
     label: "Studio receive review",
-    description: "Read a pending validated review addressed to this exact Pi session. The review body is shown visibly as untrusted reviewer text and remains pending until explicitly acknowledged.",
+    description: "Read a pending validated review addressed to this exact Pi session. Find queued IDs with studio_pending_reviews. The review body is shown visibly as untrusted reviewer text and remains pending until explicitly acknowledged.",
     parameters: Type.Object({ delivery_id: Type.String({ description: "ID returned by studio_import_review" }) }),
     execute: async (_id, params, _signal, _update, ctx) => {
       const rt = runtimeFor(ctx);
@@ -472,6 +510,37 @@ export function registerStudio(pi: PiApi): void {
       if (!result.ok) return textResult(`Review acknowledgement refused: ${result.reason}.`, undefined, true);
       updateStatus(ctx, result.job, rt.config);
       return textResult(result.reason, { job_id: result.job?.job_id, status: result.job?.status, delivery_id: params["delivery_id"] });
+    },
+  });
+  pi.registerTool({
+    name: "studio_pending_reviews",
+    label: "Studio pending reviews",
+    description: "List validated review deliveries queued for this exact Pi session. A waiting worker calls this after restart to discover its inbox without anyone ferrying delivery IDs. Listing is harmless and wakes no turns; acknowledgement stays an explicit separate step.",
+    parameters: Type.Object({}),
+    execute: async (_id, _params, _signal, _update, ctx) => {
+      const rt = runtimeFor(ctx);
+      if (!rt.location.workerId) return textResult("This session has no stable worker identity, so it owns no review inbox.", undefined, true);
+      const pending = listPendingReviews(rt.location);
+      if (pending.length === 0) return textResult("No pending reviews for this session.", { count: 0 });
+      const lines = pending.map((p) => `- ${p.id} · ${p.decision} from @${p.author} · PR #${p.pull_request} @ ${p.head_sha.slice(0, 12)} · queued ${p.created_at}${p.authority === "same-account" ? " · same-account feedback (parks for Matthew, never auto-resumes)" : ""}`);
+      return textResult([`${pending.length} pending review(s) for this session. Call studio_receive_review with an ID, then studio_ack_review.`, ...lines].join("\n"), { count: pending.length, deliveries: pending.map((p) => p.id) });
+    },
+  });
+  pi.registerTool({
+    name: "studio_adopt_legacy",
+    label: "Studio adopt legacy mission",
+    description: "Explicitly adopt the legacy shared mission snapshot into this Pi session's isolated ledger. Requires the exact legacy job id supplied by Matthew, preserves the legacy file verbatim, and refuses when another worker already adopted it or this session already has a mission. Never runs automatically.",
+    parameters: Type.Object({
+      job_id: Type.String({ description: "Exact legacy job id to adopt" }),
+    }),
+    execute: async (_id, params, _signal, _update, ctx) => {
+      const rt = runtimeFor(ctx);
+      if (!rt.location.workerId) return textResult("Adoption needs a Pi session with a stable session ID.", undefined, true);
+      const result = adoptLegacyJob(rt.location, str(params["job_id"]) ?? "");
+      if (!result.ok) return textResult(`Legacy adoption refused: ${result.reason}.`, undefined, true);
+      appendEvent(rt.location, "legacy-adopted", { job_id: result.job.job_id, status: result.job.status });
+      updateStatus(ctx, result.job, rt.config);
+      return textResult(`Adopted legacy mission ${result.job.job_id} (${result.job.status}) into this session. The legacy snapshot was preserved.`, { job_id: result.job.job_id, status: result.job.status });
     },
   });
   pi.registerTool({
@@ -876,6 +945,7 @@ export function registerStudio(pi: PiApi): void {
         );
       }
       const passed = job.evidence.checks.filter((c) => c.status === "pass").length;
+      const inbox = job.status === "WAITING_REVIEW" && rt.location.workerId ? listPendingReviews(rt.location) : [];
       const lines = [
         renderMissionBrief(job),
         `ledger: ${rt.location.dir} (${rt.location.source})`,
@@ -886,6 +956,7 @@ export function registerStudio(pi: PiApi): void {
         `reconciliations: ${job.progress.reconciliations.length}${job.progress.reconciliations.length ? ` · latest: ${job.progress.reconciliations[job.progress.reconciliations.length - 1]?.note.slice(0, 100)}` : ""}`,
         `continuation: ${job.continuation.allowed ? "armed" : "disarmed"} · turn ${job.continuation.runs}/${rt.config.maxTurns} · unchanged ${job.continuation.unchanged_streak}/${rt.config.maxUnchangedTurns} · errors ${job.continuation.error_streak}/${rt.config.maxErrorStreak}`,
         `lantern tools: ${lanternToolNames(pi).join(", ") || "not registered in this session"}`,
+        ...(job.status === "WAITING_REVIEW" ? [`pending reviews: ${inbox.length === 0 ? "none queued for this session" : inbox.map((p) => `${p.id} (${p.decision} from @${p.author})`).join("; ")}`] : []),
       ];
       if (params["include_packet"] === true) {
         const packet = readPacket(rt.location, job.job_id);
@@ -982,6 +1053,34 @@ function safeGetAllTools(pi: PiApi): { name: string }[] {
 
 function safeToolList(ctx: PiToolContext): { name: string }[] {
   return Array.isArray(ctx.tools) ? ctx.tools : [];
+}
+
+/**
+ * Pi 1.2.0 origin check. before_agent_start fires for user messages and for
+ * idle custom triggerTurn messages; only a genuine user message may release
+ * a review wait or adopt a legacy mission. Older harnesses omit the field
+ * and are treated as user-originated.
+ */
+function isUserOrigin(event: PiBeforeAgentStartEvent): boolean {
+  return event.messageType !== "custom";
+}
+
+/**
+ * GitHub logins the local worker may post with, for the same-account
+ * reviewer gate: configured logins plus the live `gh` identity when it can
+ * be read. Best-effort and advisory; the deterministic check lives in
+ * importReviewComment.
+ */
+function workerGithubLoginsFor(config: StudioConfig, cwd: string): string[] {
+  const known = new Set(config.workerGithubLogins.map((login) => login.toLowerCase()));
+  try {
+    const probe = run("gh", ["api", "user", "--jq", ".login"], cwd, 10_000);
+    const login = probe.ok ? probe.stdout.trim() : "";
+    if (/^[A-Za-z0-9-]{1,39}$/.test(login)) known.add(login.toLowerCase());
+  } catch {
+    /* offline or unauthenticated gh: configured logins still apply */
+  }
+  return [...known];
 }
 
 /** Flatten whatever shape a nested tool result came back in. */

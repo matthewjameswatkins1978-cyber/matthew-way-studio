@@ -388,7 +388,8 @@ export function normalizeJob(raw: unknown): JobState {
 
   if (job.review_wait && (job.review_wait.job_id !== job.job_id || job.review_wait.branch !== job.repo.branch || job.review_wait.head_sha.toLowerCase() !== job.repo.current_sha.toLowerCase())) {
     throw new JobParseError("review_wait identity does not match its job, branch and current head SHA");
-  }  if (job.status === "WAITING_REVIEW" && !job.review_wait) throw new JobParseError("WAITING_REVIEW has no exact review target");
+  }
+  if (job.status === "WAITING_REVIEW" && !job.review_wait) throw new JobParseError("WAITING_REVIEW has no exact review target");
   if (!job.objective) throw new JobParseError("job state has no objective");
   return job;
 }

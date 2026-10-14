@@ -75,6 +75,13 @@ export interface PiBoundaryEvent {
 
 export interface PiBeforeAgentStartEvent {
   type: "before_agent_start";
+  /**
+   * Pi 1.2.0 discriminates the run origin: "user" for a submitted prompt
+   * (composer, RPC, sendUserMessage) and "custom" for an idle custom message
+   * delivered with triggerTurn. Absent in older harnesses and tests, where
+   * every turn is treated as user-originated.
+   */
+  messageType?: "user" | "custom";
   prompt: string;
   systemPrompt: string;
   systemPromptOptions: {

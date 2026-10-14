@@ -8,11 +8,13 @@ import { ledgerLocation } from "../src/paths.js";
 import {
   ACTIVE_JOB_FILE,
   activeJobPath,
+  adoptLegacyJob,
   appendEvent,
   clearJob,
   makeJobId,
   readEvents,
   readJob,
+  readLegacySnapshot,
   readPacket,
   savePacket,
   writeJob,
@@ -129,15 +131,27 @@ test("linked Pi workers get isolated ledgers and cannot read each other's active
   assert.notEqual(path.basename(activeJobPath(a)), path.basename(activeJobPath(b)));
 });
 
-test("legacy shared job is adopted by only one worker and remains recoverable", () => {
+test("legacy shared job is never auto-claimed; explicit adoption is single-winner", () => {
   const base = tempLocation();
   const worker = (id: string) => ({ ...base, workerId: id, workerKey: createHash("sha256").update(id).digest("hex").slice(0, 24) });
   writeJob(base, job("job-legacy"));
   const a = worker("legacy-owner");
   const b = worker("legacy-contender");
-  const adopted = readJob(a);
-  assert.equal(adopted.kind === "loaded" && adopted.job.worker_session_id, "legacy-owner");
+  // An unrelated session starting first must not inherit the mission.
+  assert.deepEqual(readJob(b), { kind: "none" }, "first reader does not win");
+  assert.deepEqual(readJob(a), { kind: "none" }, "the real owner does not win by reading either");
+  assert.equal(readLegacySnapshot(base).kind, "loaded", "the snapshot stays observable without claiming");
+  // Guessing the wrong job id is refused.
+  assert.equal(adoptLegacyJob(b, "job-wrong").ok, false);
   assert.deepEqual(readJob(b), { kind: "none" });
-  assert.equal(readJob(a).kind, "loaded", "the winning worker resumes its scoped copy after restart");
+  // The owner adopts explicitly with the exact id Matthew gave it.
+  const adopted = adoptLegacyJob(a, "job-legacy");
+  assert.equal(adopted.ok, true);
+  if (!adopted.ok) return;
+  assert.equal(adopted.job.worker_session_id, "legacy-owner");
+  assert.equal(readJob(a).kind, "loaded", "the owner resumes its scoped copy after restart");
+  // A second worker naming the same id is refused: single winner.
+  assert.equal(adoptLegacyJob(b, "job-legacy").ok, false);
+  assert.deepEqual(readJob(b), { kind: "none" });
   assert.equal(fs.existsSync(path.join(base.dir, ACTIVE_JOB_FILE)), true, "the original shared snapshot is preserved");
 });

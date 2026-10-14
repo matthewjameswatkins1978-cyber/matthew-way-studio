@@ -6,6 +6,7 @@ import { run } from "./paths.js";
 import { readJob, writeJob } from "./ledger.js";
 import type { LedgerLocation } from "./paths.js";
 import { applyTransition, normalizeJob, type JobState } from "./schema.js";
+import { applyBlock } from "./mission.js";
 
 export interface PullRequestSnapshot {
   repository: string;
@@ -55,6 +56,8 @@ export interface ReviewEnvelope {
   job_id: string;
   head_sha: string;
   decision: ReviewDecision;
+  /** Owning Pi session. Absent only in v1 envelopes; unambiguous routing requires it. */
+  worker_session_id?: string;
 }
 export interface ReviewComment {
   id: number;
@@ -77,6 +80,13 @@ export interface ReviewDelivery {
   created_at: string;
   state: "pending" | "acknowledged";
   acknowledged_at?: string;
+  /**
+   * independent: the comment author is a provisioned reviewer identity
+   * distinct from every GitHub login the workers use. same-account: the
+   * author shares a worker GitHub identity, so the feedback can pause for
+   * Matthew but can never resume work by itself (see acknowledgeReview).
+   */
+  authority: "independent" | "same-account";
 }
 
 const MAX_REVIEW_BODY_BYTES = 16 * 1024;
@@ -90,12 +100,15 @@ export function parseReviewEnvelope(body: string): ReviewEnvelope | undefined {
   try {
     const raw = JSON.parse(matches[0][1]) as Record<string, unknown>;
     const keys = Object.keys(raw).sort().join(",");
-    if (keys !== "decision,head_sha,job_id,pull_request,repository") return undefined;
+    const v1 = keys === "decision,head_sha,job_id,pull_request,repository";
+    const v1Worker = keys === "decision,head_sha,job_id,pull_request,repository,worker_session_id";
+    if (!v1 && !v1Worker) return undefined;
     if (typeof raw.repository !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw.repository)) return undefined;
     if (typeof raw.pull_request !== "number" || !Number.isSafeInteger(raw.pull_request) || raw.pull_request < 1) return undefined;
     if (typeof raw.job_id !== "string" || !/^job-[A-Za-z0-9-]{1,80}$/.test(raw.job_id)) return undefined;
     if (typeof raw.head_sha !== "string" || !/^[0-9a-f]{40}$/.test(raw.head_sha)) return undefined;
     if (raw.decision !== "changes_requested" && raw.decision !== "approved" && raw.decision !== "hold") return undefined;
+    if (v1Worker && (typeof raw.worker_session_id !== "string" || !/^[A-Za-z0-9_:.~-]{1,128}$/.test(raw.worker_session_id))) return undefined;
     return raw as unknown as ReviewEnvelope;
   } catch {
     return undefined;
@@ -158,6 +171,10 @@ export function importReviewComment(input: {
   repository: string;
   commentId: number;
   authorizedReviewers: string[];
+  /** GitHub logins the workers themselves use. A comment from one of these is never independent reviewer authority. */
+  workerGithubLogins?: string[];
+  /** Allow same-account comments to queue as non-authoritative feedback. Defaults to false (rejected). */
+  allowSameAccountReviews?: boolean;
   cwd: string;
   now?: number;
   readComment?: typeof readComment;
@@ -171,6 +188,9 @@ export function importReviewComment(input: {
   if (!comment) return { ok: false, reason: "GitHub comment could not be read and verified" };
   if (comment.id !== input.commentId) return { ok: false, reason: "GitHub comment id does not match request" };
   if (!input.authorizedReviewers.some((login) => login.toLowerCase() === comment.user.login.toLowerCase())) return { ok: false, reason: "comment author is not in the configured reviewer allowlist" };
+  const sharesWorkerIdentity = (input.workerGithubLogins ?? []).some((login) => login.toLowerCase() === comment.user.login.toLowerCase());
+  if (sharesWorkerIdentity && input.allowSameAccountReviews !== true) return { ok: false, reason: "comment author shares a worker GitHub identity; independent reviewer authority is not established" };
+  const authority: ReviewDelivery["authority"] = sharesWorkerIdentity ? "same-account" : "independent";
   const envelope = parseReviewEnvelope(comment.body);
   if (!envelope) return { ok: false, reason: "comment has no valid exact review envelope" };
   let issue: URL;
@@ -186,31 +206,43 @@ export function importReviewComment(input: {
   try { snapshotFiles = fs.readdirSync(input.location.dir).filter((name) => /^active-job\.[a-f0-9]{24}\.json$/.test(name)); }
   catch { return { ok: false, reason: "shared worker ledger is unavailable" }; }
   if (snapshotFiles.length > 256) return { ok: false, reason: "worker ledger exceeds the bounded review-import scan limit" };
-  let job: JobState | undefined;
-  let workerId: string | undefined;
+  const candidates: { job: JobState; workerId: string }[] = [];
   for (const fileName of snapshotFiles) {
     try {
       const candidate = normalizeJob(JSON.parse(fs.readFileSync(path.join(input.location.dir, fileName), "utf8")));
       const wait = candidate.review_wait;
       if (candidate.job_id === envelope.job_id && candidate.status === "WAITING_REVIEW" && candidate.worker_session_id && wait?.worker_session_id === candidate.worker_session_id && wait.repository.toLowerCase() === envelope.repository.toLowerCase() && wait.pull_request === envelope.pull_request && wait.head_sha === envelope.head_sha && wait.branch === commentTarget.pull_request.branch) {
         const key = createHash("sha256").update(candidate.worker_session_id).digest("hex").slice(0, 24);
-        if (fileName === `active-job.${key}.json`) { job = candidate; workerId = candidate.worker_session_id; break; }
+        if (fileName === `active-job.${key}.json`) candidates.push({ job: candidate, workerId: candidate.worker_session_id });
       }
     } catch { /* ignore unreadable or foreign snapshots */ }
   }
-  if (!job || !workerId || !job.review_wait) return { ok: false, reason: "no exact worker-owned WAITING_REVIEW job matches the comment envelope" };
+  // Never pick an arbitrary recipient: a worker-bound envelope routes to its
+  // exact owner, and a legacy envelope without one is refused when ambiguous.
+  const owned = envelope.worker_session_id ? candidates.filter((c) => c.workerId === envelope.worker_session_id) : candidates;
+  if (owned.length === 0) return { ok: false, reason: "no exact worker-owned WAITING_REVIEW job matches the comment envelope" };
+  if (owned.length > 1) return { ok: false, reason: "ambiguous review target: more than one waiting worker matches this envelope; refusing arbitrary delivery" };
+  const routed = owned[0];
+  if (!routed || !routed.job.review_wait) return { ok: false, reason: "no exact worker-owned WAITING_REVIEW job matches the comment envelope" };
+  const job = routed.job;
+  const workerId = routed.workerId;
   const wait = job.review_wait;
+  if (!wait) return { ok: false, reason: "no exact worker-owned WAITING_REVIEW job matches the comment envelope" };
   const created = Date.parse(comment.created_at);
   if (!Number.isFinite(created) || created > (input.now ?? Date.now()) || (input.now ?? Date.now()) - created > MAX_REVIEW_AGE_MS) return { ok: false, reason: "review comment timestamp is invalid or expired" };
   const live = jobReader(wait.repository, wait.pull_request, input.cwd);
   if (!live.ok || live.pull_request.state !== "open" || live.pull_request.repository.toLowerCase() !== wait.repository.toLowerCase() || live.pull_request.branch !== wait.branch || live.pull_request.head_sha !== wait.head_sha) return { ok: false, reason: "live PR no longer matches the waiting repository, branch and head SHA" };
-  const decisionKey = createHash("sha256").update(`${job.job_id}\n${wait.head_sha}\n${envelope.decision}`).digest("hex").slice(0, 32);
-  const id = `review-${decisionKey}`;
+  // Event identity: every GitHub comment is its own delivery, so two different
+  // findings on the same commit never collapse into one receipt. Re-importing
+  // the same comment returns the existing delivery (see the queue scan below).
+  const eventKey = createHash("sha256").update(`${job.job_id}\n${wait.head_sha}\n${comment.id}`).digest("hex").slice(0, 32);
+  const id = `review-${eventKey}`;
   const file = deliveryPath(input.location, workerId, id);
   const delivery: ReviewDelivery = {
     id, comment_id: comment.id, repository: wait.repository, pull_request: wait.pull_request,
     job_id: job.job_id, head_sha: wait.head_sha, worker_session_id: workerId,
     author: comment.user.login, decision: envelope.decision,
+    authority,
     body: comment.body.replace(/^<!-- mws-review\/v1\n[\s\S]*?\n-->$/m, "").trim().slice(0, MAX_REVIEW_BODY_BYTES),
     created_at: comment.created_at, state: "pending",
   };
@@ -220,8 +252,10 @@ export function importReviewComment(input: {
     for (const name of fs.readdirSync(queueDir).filter((name) => name.endsWith(".json"))) {
       try {
         const prior = JSON.parse(fs.readFileSync(path.join(queueDir, name), "utf8")) as ReviewDelivery;
-        if (prior.comment_id === comment.id && (prior.job_id !== delivery.job_id || prior.head_sha !== delivery.head_sha || prior.decision !== delivery.decision)) return { ok: false, reason: "this GitHub comment id was already bound to a different review decision" };
-        if (prior.job_id === delivery.job_id && prior.head_sha === delivery.head_sha && prior.decision === delivery.decision && prior.worker_session_id === workerId) return { ok: true, delivery: prior, duplicate: true };
+        if (prior.comment_id === comment.id) {
+          if (prior.job_id !== delivery.job_id || prior.head_sha !== delivery.head_sha || prior.decision !== delivery.decision || prior.worker_session_id !== workerId) return { ok: false, reason: "this GitHub comment id was already bound to a different review decision" };
+          return { ok: true, delivery: prior, duplicate: true };
+        }
       } catch { /* malformed receipts do not authorize or deduplicate */ }
     }
   } catch { /* queue creation below reports any write failure */ }
@@ -242,8 +276,36 @@ export function readReviewDelivery(loc: LedgerLocation, deliveryId: string): Rev
   try {
     const delivery = JSON.parse(fs.readFileSync(deliveryPath(loc, loc.workerId, deliveryId), "utf8")) as ReviewDelivery;
     if (delivery.worker_session_id !== loc.workerId || delivery.id !== deliveryId) return undefined;
+    // Deliveries queued before reviewer-authority tracking default to the
+    // previous behavior; anything else unknown fails closed.
+    if (delivery.authority === undefined) delivery.authority = "independent";
+    if (delivery.authority !== "independent" && delivery.authority !== "same-account") return undefined;
     return delivery;
   } catch { return undefined; }
+}
+
+/**
+ * Pending inbox for exactly this Pi session. The owner discovers its queued
+ * reviews after restart without anyone ferrying delivery IDs: session start,
+ * the WAITING_REVIEW prompt section, studio_status and studio_pending_reviews
+ * all read this. Never triggers a model turn by itself.
+ */
+export function listPendingReviews(loc: LedgerLocation): ReviewDelivery[] {
+  if (!loc.workerId) return [];
+  const queueDir = path.join(loc.dir, "review-deliveries", createHash("sha256").update(loc.workerId).digest("hex").slice(0, 24));
+  let names: string[];
+  try {
+    names = fs.readdirSync(queueDir).filter((name) => /^review-[a-f0-9]{32}\.json$/.test(name));
+  } catch {
+    return [];
+  }
+  const out: ReviewDelivery[] = [];
+  for (const name of names) {
+    const delivery = readReviewDelivery(loc, name.slice(0, -5));
+    if (delivery && delivery.state === "pending") out.push(delivery);
+  }
+  out.sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
+  return out;
 }
 
 /** Idempotently acknowledge exactly one pending delivery; no merge authority is represented. */
@@ -253,12 +315,29 @@ export function acknowledgeReview(loc: LedgerLocation, deliveryId: string, cwd: 
   const snap = readJob(loc);
   if (snap.kind !== "loaded") return { ok: false, reason: "owning job is unavailable" };
   const job = snap.job;
-  if (job.job_id !== delivery.job_id || job.worker_session_id !== loc.workerId || (job.status !== "WAITING_REVIEW" && job.status !== "WORKING") || job.review_wait?.worker_session_id !== loc.workerId || job.review_wait.repository !== delivery.repository || job.review_wait.pull_request !== delivery.pull_request || job.review_wait.head_sha !== delivery.head_sha) {
+  if (job.job_id !== delivery.job_id || job.worker_session_id !== loc.workerId || (job.status !== "WAITING_REVIEW" && job.status !== "WORKING" && !(delivery.state === "acknowledged" && job.status === "NEEDS_HUMAN")) || job.review_wait?.worker_session_id !== loc.workerId || job.review_wait.repository !== delivery.repository || job.review_wait.pull_request !== delivery.pull_request || job.review_wait.head_sha !== delivery.head_sha) {
     return { ok: false, reason: "job, worker, PR or head SHA no longer matches the delivery" };
   }
+  // An already-acknowledged delivery stays idempotent even after its job left the wait (parked for Matthew); a pending delivery never acts outside the wait.
   const live = jobReader(delivery.repository, delivery.pull_request, cwd);
   if (!live.ok || live.pull_request.state !== "open" || live.pull_request.repository.toLowerCase() !== delivery.repository.toLowerCase() || live.pull_request.branch !== job.review_wait.branch || live.pull_request.head_sha !== delivery.head_sha) return { ok: false, reason: "live PR changed after import; refusing stale review delivery" };
   if (delivery.state === "acknowledged" && (delivery.decision === "hold" || job.status === "WORKING")) return { ok: true, reason: "review delivery was already acknowledged", job };
+  // A same-GitHub-identity comment is feedback, not reviewer approval: it can
+  // pause the mission for Matthew's eyes, but it never resumes work by itself.
+  if (delivery.authority === "same-account" && delivery.state === "pending" && delivery.decision !== "hold") {
+    delivery.state = "acknowledged";
+    delivery.acknowledged_at = now;
+    writeAtomic(deliveryPath(loc, loc.workerId, deliveryId), delivery);
+    if (job.status === "WORKING") return { ok: true, reason: "same-account feedback recorded; mission already resumed by an independent decision", job };
+    const parked = applyBlock(job, {
+      kind: "external-approval",
+      reason: `review feedback arrived under a shared worker GitHub identity (@${delivery.author}), which cannot authorize resumption by itself`,
+      exact_human_need: `review the queued feedback from @${delivery.author} on PR #${delivery.pull_request} and say how to proceed`,
+      resume_condition: "Matthew states the next action for this mission.",
+    });
+    writeJob(loc, parked);
+    return { ok: true, reason: "same-account feedback parked for Matthew; not reviewer approval, no merge authority", job: parked };
+  }
   if (delivery.state === "pending" && delivery.decision !== "hold") {
     const resumed = applyTransition(job, "WORKING");
     const updated: JobState = { ...resumed, continuation: { ...job.continuation, allowed: true, reason: `authorized review decision: ${delivery.decision}` }, progress: { ...job.progress, next_action: delivery.decision === "changes_requested" ? "Address the authorized review feedback, then rerun required checks." : "Verify required checks and report the approved review outcome; do not merge." }, updated_at: now };
@@ -269,12 +348,13 @@ export function acknowledgeReview(loc: LedgerLocation, deliveryId: string, cwd: 
     writeJob(loc, updated);
     return { ok: true, reason: "review acknowledged; mission resumed without merge authority", job: updated };
   }
-  if (delivery.decision === "hold") {
+  if (delivery.decision === "hold" && job.status === "WAITING_REVIEW") {
     delivery.state = "acknowledged";
     delivery.acknowledged_at = now;
     writeAtomic(deliveryPath(loc, loc.workerId, deliveryId), delivery);
     return { ok: true, reason: "hold acknowledged; mission remains WAITING_REVIEW", job };
   }
+  if (delivery.state === "acknowledged" && delivery.authority === "same-account") return { ok: true, reason: "same-account feedback was already recorded; Matthew's direction still governs", job };
   if (delivery.state === "acknowledged" && job.status === "WAITING_REVIEW") {
     const resumed = applyTransition(job, "WORKING");
     const updated: JobState = { ...resumed, continuation: { ...job.continuation, allowed: true, reason: `authorized review decision: ${delivery.decision}` }, progress: { ...job.progress, next_action: delivery.decision === "changes_requested" ? "Address the authorized review feedback, then rerun required checks." : "Verify required checks and report the approved review outcome; do not merge." }, updated_at: now };
