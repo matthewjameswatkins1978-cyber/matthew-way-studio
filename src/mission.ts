@@ -5,6 +5,7 @@
  * and the whole state machine is testable without a running agent.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   SCHEMA_VERSION,
   applyTransition,
@@ -86,11 +87,13 @@ export function startMission(input: {
 }): JobState {
   const contract = compilePacket(input.packet);
   const sections = parseSections(input.packet);
-  const jobId = makeJobId(`${input.facts.root}:${input.facts.branch}:${input.facts.head_sha}:${contract.objective}`);
+  const nonce = randomUUID().slice(0, 8);
+  const jobId = makeJobId(`${input.facts.root}:${input.facts.branch}:${input.facts.head_sha}:${contract.objective}:${input.location.workerId ?? "legacy"}:${nonce}`);
   const packetMeta = savePacket(input.location, jobId, input.packet);
   return {
     schema_version: SCHEMA_VERSION,
     job_id: jobId,
+    ...(input.location.workerId ? { worker_session_id: input.location.workerId } : {}),
     status: "WORKING",
     ...contract,
     repo: {
@@ -116,6 +119,71 @@ export function startMission(input: {
     packet: packetMeta,
     created_at: input.now ?? new Date().toISOString(),
     updated_at: input.now ?? new Date().toISOString(),
+  };
+}
+
+export interface ReviewWaitInput {
+  repository: string;
+  pull_request: number;
+  url: string;
+  branch: string;
+  head_sha: string;
+  worker_session_id: string;
+  requested_review: "general" | "approval" | "correction";
+  requested_at?: string;
+}
+
+/** Enter a durable reviewer wait only when every identity matches this job. */
+export function applyReviewWait(job: JobState, input: ReviewWaitInput): JobState {
+  if (job.status === "WAITING_REVIEW") {
+    const current = job.review_wait;
+    if (current && current.repository === input.repository && current.pull_request === input.pull_request && current.head_sha.toLowerCase() === input.head_sha.toLowerCase() && current.worker_session_id === input.worker_session_id) return job;
+    throw new Error("a different reviewer wait is already active for this mission");
+  }
+  if (job.status !== "WORKING") throw new Error(`cannot wait for review while mission is ${job.status}`);
+  if (!input.repository || !input.pull_request || !input.url || !input.branch || !input.worker_session_id) throw new Error("review target is missing repository, PR, branch or worker identity");
+  if (job.repo.branch !== input.branch || job.repo.current_sha.toLowerCase() !== input.head_sha.toLowerCase()) throw new Error("review branch or head SHA does not match the mission's current repository state");
+  if (input.head_sha !== input.head_sha.toLowerCase() || !/^[0-9a-f]{40}$/.test(input.head_sha)) throw new Error("review head SHA must be a canonical 40-character lowercase SHA");
+  const now = input.requested_at ?? new Date().toISOString();
+  const transitioned = applyTransition(job, "WAITING_REVIEW");
+  return {
+    ...transitioned,
+    status: "WAITING_REVIEW",
+    review_wait: { ...input, job_id: job.job_id, requested_at: now },
+    blocker: undefined,
+    continuation: { ...job.continuation, allowed: false, reason: "waiting for reviewer decision" },
+    updated_at: now,
+  };
+}
+/**
+ * Genuine human recovery from a review wait whose channel is dead: no valid
+ * review can be delivered (offline reviewer, lost envelope, forged noise).
+ * Only a user-originated turn may invoke this (the extension gates on
+ * messageType === "user"); it is recorded as a human override, never as
+ * reviewer approval, and it grants no merge authority.
+ */
+export function applyReviewWaitRecovery(
+  job: JobState,
+  input: { mode: "resume" | "park"; reason: string; now?: string },
+): JobState {
+  if (job.status !== "WAITING_REVIEW" || !job.review_wait) throw new Error("no review wait to recover from");
+  if (!input.reason.trim()) throw new Error("recovery needs an explicit human reason");
+  const now = input.now ?? new Date().toISOString();
+  if (input.mode === "park") {
+    const parked = applyBlock(job, {
+      kind: "external-approval",
+      reason: `review wait abandoned by Matthew: ${input.reason.trim()}`,
+      exact_human_need: input.reason.trim(),
+      resume_condition: "Matthew states the next action for this mission.",
+    });
+    return { ...parked, updated_at: now };
+  }
+  const resumed = applyTransition(job, "WORKING");
+  return {
+    ...resumed,
+    continuation: { ...job.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: "human review-wait recovery; not reviewer approval" },
+    progress: { ...job.progress, next_action: input.reason.trim().slice(0, 300) },
+    updated_at: now,
   };
 }
 

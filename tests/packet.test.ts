@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compilePacket, detectControlIntent, isSubstantivePacket, looksLikeResumeAttempt, parseSections } from "../src/packet.js";
+import { compilePacket, detectControlIntent, detectLegacyAdoptionIntent, detectReviewRecoveryIntent, isSubstantivePacket, looksLikeResumeAttempt, parseSections } from "../src/packet.js";
 import { requestsExecutionHold } from "../src/authority.js";
 
 const PACKET = `# DEMO
@@ -91,4 +91,25 @@ test("resume attempts are recognised without assuming resolution", () => {
   assert.equal(looksLikeResumeAttempt("done"), "attempt");
   assert.equal(looksLikeResumeAttempt("why is the sky blue"), "unrelated");
   assert.equal(looksLikeResumeAttempt(""), "unrelated");
+});
+
+test("review recovery vocabulary is narrow: only explicit phrases release the wait", () => {
+  assert.equal(detectReviewRecoveryIntent("cancel review wait"), "resume");
+  assert.equal(detectReviewRecoveryIntent("resume the mission"), "resume");
+  assert.equal(detectReviewRecoveryIntent("resume from review wait and continue"), "resume");
+  assert.equal(detectReviewRecoveryIntent("park the mission"), "park");
+  assert.equal(detectReviewRecoveryIntent("cancel review wait and park it"), "park");
+  assert.equal(detectReviewRecoveryIntent("go ahead"), undefined, "vague continuation never releases the wait");
+  assert.equal(detectReviewRecoveryIntent("continue"), undefined);
+  assert.equal(detectReviewRecoveryIntent("looks good, thanks"), undefined);
+  assert.equal(detectReviewRecoveryIntent("x".repeat(500)), undefined);
+});
+
+test("legacy adoption needs the words adopt and legacy plus an exact job id", () => {
+  assert.equal(detectLegacyAdoptionIntent("adopt legacy job job-20261014-abcdef12"), "job-20261014-abcdef12");
+  assert.equal(detectLegacyAdoptionIntent("please adopt the legacy job job-x for this session"), "job-x");
+  assert.equal(detectLegacyAdoptionIntent("adopt legacy job"), undefined, "no id, no adoption");
+  assert.equal(detectLegacyAdoptionIntent("adopt job job-x"), undefined, "legacy must be named");
+  assert.equal(detectLegacyAdoptionIntent("here is the legacy job job-x"), undefined, "adopt must be named");
+  assert.equal(detectLegacyAdoptionIntent("thanks"), undefined);
 });

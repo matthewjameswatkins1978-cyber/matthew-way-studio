@@ -12,9 +12,9 @@
 
 import { currentRuleSnapshot, legacyRuleSnapshot, parseRuleSnapshot, type RuleSnapshot } from "./rules.js";
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
-export const STATUSES = ["WORKING", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"] as const;
+export const STATUSES = ["WORKING", "WAITING_REVIEW", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"] as const;
 export type JobStatus = (typeof STATUSES)[number];
 
 export type BlockerKind =
@@ -135,15 +135,29 @@ export interface JobContinuation {
   reason: string;
 }
 
+export interface ReviewWaitTarget {
+  repository: string;
+  pull_request: number;
+  url: string;
+  branch: string;
+  head_sha: string;
+  job_id: string;
+  worker_session_id: string;
+  requested_review: "general" | "approval" | "correction";
+  requested_at: string;
+}
 export interface JobState extends JobContract {
   schema_version: number;
   job_id: string;
+  /** The Pi session that owns this mission; prevents shared-worktree state bleed. */
+  worker_session_id?: string;
   status: JobStatus;
   repo: JobRepo;
   progress: JobProgress;
   evidence: JobEvidence;
   memory: JobMemory;
   blocker?: JobBlocker;
+  review_wait?: ReviewWaitTarget;
   human_dogfood: JobDogfood;
   continuation: JobContinuation;
   /** Exact operating rules pinned when the mission began. */
@@ -159,7 +173,8 @@ export interface JobState extends JobContract {
  * state is idempotent instead of throwing at a tool boundary.
  */
 const TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
-  WORKING: ["WORKING", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"],
+  WORKING: ["WORKING", "WAITING_REVIEW", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"],
+  WAITING_REVIEW: ["WAITING_REVIEW", "WORKING", "NEEDS_HUMAN", "FAILED"],
   NEEDS_HUMAN: ["NEEDS_HUMAN", "WORKING", "FAILED"],
   COMPLETE: ["COMPLETE", "WORKING"],
   PARTIAL: ["PARTIAL", "WORKING"],
@@ -212,6 +227,28 @@ export class JobParseError extends Error {}
  * caller preserves the file and starts clean. Missing/older versions are
  * migrated forward with defaults.
  */
+function normalizeReviewWait(value: unknown): ReviewWaitTarget | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null) throw new JobParseError("review_wait is not an object");
+  const raw = value as Record<string, unknown>;
+  const requestedReview = str(raw.requested_review);
+  if (requestedReview !== "general" && requestedReview !== "approval" && requestedReview !== "correction") throw new JobParseError("review_wait has an unknown requested_review");
+  const target: ReviewWaitTarget = {
+    repository: str(raw.repository),
+    pull_request: clampInt(raw.pull_request, 0, 0),
+    url: str(raw.url),
+    branch: str(raw.branch),
+    head_sha: str(raw.head_sha),
+    job_id: str(raw.job_id),
+    worker_session_id: str(raw.worker_session_id),
+    requested_review: requestedReview === "approval" || requestedReview === "correction" ? requestedReview : "general",
+    requested_at: str(raw.requested_at),
+  };
+  if (!target.repository || !target.pull_request || !target.url || !target.branch || !/^[0-9a-f]{40}$/i.test(target.head_sha) || !target.job_id || !target.worker_session_id || !target.requested_at) {
+    throw new JobParseError("review_wait is missing its exact PR, head, job or worker identity");
+  }
+  return target;
+}
 export function normalizeJob(raw: unknown): JobState {
   if (typeof raw !== "object" || raw === null) throw new JobParseError("job state is not an object");
   const obj = raw as Record<string, unknown>;
@@ -251,7 +288,9 @@ export function normalizeJob(raw: unknown): JobState {
   const job: JobState = {
     schema_version: SCHEMA_VERSION,
     job_id: str(obj.job_id) || `job-${Date.now().toString(36)}`,
+    ...(typeof obj.worker_session_id === "string" && obj.worker_session_id ? { worker_session_id: obj.worker_session_id } : {}),
     status,
+    ...(obj.review_wait === undefined ? {} : { review_wait: normalizeReviewWait(obj.review_wait) }),
     objective: str(obj.objective),
     scope: strList(obj.scope),
     authority: strList(obj.authority),
@@ -347,6 +386,10 @@ export function normalizeJob(raw: unknown): JobState {
     };
   }
 
+  if (job.review_wait && (job.review_wait.job_id !== job.job_id || job.review_wait.branch !== job.repo.branch || job.review_wait.head_sha.toLowerCase() !== job.repo.current_sha.toLowerCase())) {
+    throw new JobParseError("review_wait identity does not match its job, branch and current head SHA");
+  }
+  if (job.status === "WAITING_REVIEW" && !job.review_wait) throw new JobParseError("WAITING_REVIEW has no exact review target");
   if (!job.objective) throw new JobParseError("job state has no objective");
   return job;
 }

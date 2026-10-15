@@ -233,3 +233,42 @@ export function detectControlIntent(text: string): "pause" | "resume" | undefine
   if (lower === "continue" || lower === "resume" || lower === "keep going" || lower === "/studio start" || lower === "go ahead" || lower === "start now") return "resume";
   return undefined;
 }
+
+/**
+ * Explicit human escape from WAITING_REVIEW, and nothing else. The vocabulary
+ * is deliberately narrow: vague continuations ("go ahead", "continue") must
+ * never release a review wait, and only a user-originated turn may invoke the
+ * recovery (the extension gates on the Pi 1.2.0 message origin). "resume"
+ * returns to WORKING with fresh human direction; "park" blocks for Matthew.
+ * Neither is reviewer approval and neither merges.
+ */
+export function detectReviewRecoveryIntent(text: string): "resume" | "park" | undefined {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 400) return undefined;
+  const lower = trimmed.toLowerCase();
+  if (/\bpark\b[^.\n]{0,40}\b(mission|job|review wait)\b/i.test(trimmed)) return "park";
+  if (/\bcancel\b[^.\n]{0,40}\breview wait\b/i.test(trimmed)) {
+    return /\bpark\b|\bhold\b|\bwait for me\b/i.test(trimmed) ? "park" : "resume";
+  }
+  if (/\b(resume|leave|exit)\b[^.\n]{0,40}\breview wait\b/i.test(trimmed)) return "resume";
+  if (/\bresume from\b[^.\n]{0,40}\breview\b/i.test(trimmed)) return "resume";
+  if (lower === "resume the mission" || /\bresume the mission\b[^.\n]{0,40}\breview\b/i.test(trimmed)) return "resume";
+  return undefined;
+}
+
+/**
+ * Explicit human approval to adopt the legacy shared mission into this
+ * session's isolated ledger. The vocabulary is deliberately narrow — the
+ * words adopt + legacy + an exact job id — and only a user-originated turn
+ * may invoke it (the extension gates on the Pi 1.2.0 message origin). The
+ * job id itself is not a secret: it is readable from the shared snapshot,
+ * so the boundary is Matthew's authorship of the message in the owning
+ * session, not knowledge of the identifier. Returns the named job id.
+ */
+export function detectLegacyAdoptionIntent(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 400) return undefined;
+  if (!/\badopt\b/i.test(trimmed) || !/\blegacy\b/i.test(trimmed)) return undefined;
+  const match = /\b(job-[A-Za-z0-9-]{1,80})\b/.exec(trimmed);
+  return match?.[1];
+}

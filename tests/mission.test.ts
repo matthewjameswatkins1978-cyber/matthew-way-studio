@@ -11,6 +11,7 @@ import {
   applyCheckpoint,
   applyComplete,
   applyMemory,
+  applyReviewWait,
   blockerSignature,
   evaluateCompletion,
   initialNextAction,
@@ -18,7 +19,7 @@ import {
   startMission,
 } from "../src/mission.js";
 import { parseSections } from "../src/packet.js";
-import { progressSignature, type JobState } from "../src/schema.js";
+import { normalizeJob, progressSignature, type JobState } from "../src/schema.js";
 import type { RepoFacts } from "../src/git.js";
 
 function facts(over: Partial<RepoFacts> = {}): RepoFacts {
@@ -110,6 +111,29 @@ test("a small crossed wire is reconciled in-place and counts as progress", () =>
   assert.equal(duplicate.progress.reconciliations.length, 1, "identical reconciliation is not spammed");
 });
 
+test("WAITING_REVIEW is durable and bound to this job, branch, head and worker", () => {
+  const job = startMission({ packet: PACKET, location: location(), facts: facts() });
+  const input = {
+    repository: "acme/widget",
+    pull_request: 35,
+    url: "https://github.com/acme/widget/pull/35",
+    branch: "feature/reviewed-work",
+    head_sha: "1111111111111111111111111111111111111111",
+    worker_session_id: "pi-session-a",
+    requested_review: "correction" as const,
+    requested_at: "2026-10-14T20:00:00.000Z",
+  };
+  const waiting = applyReviewWait({ ...job, repo: { ...job.repo, branch: input.branch } }, input);
+  assert.equal(waiting.status, "WAITING_REVIEW");
+  assert.equal(waiting.review_wait?.job_id, job.job_id);
+  assert.equal(waiting.review_wait?.worker_session_id, "pi-session-a");
+  assert.equal(waiting.continuation.allowed, false);
+  assert.equal(waiting.continuation.runs, job.continuation.runs);
+  assert.equal(applyReviewWait(waiting, input), waiting, "duplicate wait registration is idempotent");
+  assert.throws(() => applyReviewWait(waiting, { ...input, worker_session_id: "pi-session-b" }), /different reviewer wait/);
+  assert.throws(() => applyReviewWait({ ...job, repo: { ...job.repo, branch: input.branch } }, { ...input, head_sha: "2222222222222222222222222222222222222222" }), /head SHA/);  const staleSnapshot = { ...waiting, repo: { ...waiting.repo, current_sha: "2222222222222222222222222222222222222222" } };
+  assert.throws(() => normalizeJob(staleSnapshot), /does not match its job, branch and current head SHA/);
+});
 test("ambiguous blockers must absorb noise before spending human attention", () => {
   assert.equal(assessBlockerAdmission("credential", []).ok, true, "a credential is genuinely human-owned");
   const vague = assessBlockerAdmission("other", []);

@@ -57,6 +57,11 @@ export function decideContinuation(job: JobState, input: ObserveInput, limits: C
     return { action: "settle", reason: next.reason, continuation: next };
   }
 
+  if (job.status === "WAITING_REVIEW") {
+    next.allowed = false;
+    next.reason = "waiting for reviewer decision";
+    return { action: "settle", reason: next.reason, continuation: previous };
+  }
   if (job.status === "NEEDS_HUMAN") {
     next.allowed = false;
     next.reason = "waiting for a human-only dependency";

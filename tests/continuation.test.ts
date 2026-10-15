@@ -57,6 +57,27 @@ test("a user abort never auto-continues", () => {
   assert.equal(decision.continuation.allowed, false);
 });
 
+test("WAITING_REVIEW settles without consuming runs or no-progress allowance", () => {
+  const base = job();
+  const waiting = job({
+    status: "WAITING_REVIEW",
+    review_wait: {
+      repository: "acme/widget",
+      pull_request: 35,
+      url: "https://github.com/acme/widget/pull/35",
+      branch: "feature/reviewed-work",
+      head_sha: "a".repeat(40),
+      job_id: base.job_id,
+      worker_session_id: "pi-session-a",
+      requested_review: "correction",
+      requested_at: "2026-10-14T20:00:00.000Z",
+    },
+    continuation: { allowed: false, runs: 8, unchanged_streak: 2, error_streak: 1, last_signature: "same", reason: "waiting for reviewer decision" },
+  });
+  const decision = decideContinuation(waiting, { turnCompleted: true, errored: true, aborted: false });
+  assert.equal(decision.action, "settle");
+  assert.deepEqual(decision.continuation, waiting.continuation, "waiting preserves every counter and stays disarmed");
+});
 test("NEEDS_HUMAN and terminal states stop continuation", () => {
   assert.equal(decideContinuation(job({ status: "NEEDS_HUMAN" }), ok).action, "settle");
   assert.equal(decideContinuation(job({ status: "COMPLETE" }), ok).action, "settle");
