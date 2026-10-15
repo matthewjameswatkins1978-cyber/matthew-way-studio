@@ -178,3 +178,47 @@ test("the last acknowledged decision governs, not the newest GitHub comment (doc
   assert.equal(readReviewDelivery(owner(), newerApproval.delivery.id)?.state, "acknowledged");
   assert.equal(listPendingReviews(owner()).length, 0, "every receipt is acknowledged exactly once");
 });
+
+test("an already-acknowledged approval is a no-op after a later hold re-paused the job", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mws-review-dup-approval-"));
+  waitingJob(dir, OWNER);
+  const owner = () => location(dir, OWNER);
+  const ack = (deliveryId: string, at: string) => acknowledgeReview(owner(), deliveryId, dir, at, liveReader);
+
+  const approved = importer(dir, comment(9406, "lucy-reviewer", "approved", "2026-10-14T10:00:00.000Z"));
+  const held = importer(dir, comment(9407, "lucy-reviewer", "hold", "2026-10-14T11:00:00.000Z"));
+  assert.equal(approved.ok && held.ok, true);
+  if (!approved.ok || !held.ok) return;
+
+  // 1. The independent approval resumes the worker.
+  const first = ack(approved.delivery.id, "2026-10-14T12:10:00.000Z");
+  assert.equal(first.ok, true);
+  const resumed = readJob(owner());
+  assert.equal(resumed.kind === "loaded" && resumed.job.status, "WORKING");
+
+  // 2. The subsequent independent hold re-pauses and disarms it.
+  const second = ack(held.delivery.id, "2026-10-14T12:20:00.000Z");
+  assert.equal(second.ok, true);
+  assert.match(second.reason, /re-paused/);
+  const paused = readJob(owner());
+  assert.equal(paused.kind === "loaded" && paused.job.status, "WAITING_REVIEW");
+  if (paused.kind !== "loaded") return;
+  assert.equal(paused.job.continuation.allowed, false, "the hold disarms the worker");
+  const pausedUpdatedAt = paused.job.updated_at;
+
+  // 3. Retrying the old, already-acknowledged approval stays harmless.
+  const retry = ack(approved.delivery.id, "2026-10-14T12:30:00.000Z");
+  assert.equal(retry.ok, true);
+  assert.match(retry.reason, /already acknowledged/);
+
+  // 4. No new transition occurs: the later hold still governs.
+  const after = readJob(owner());
+  assert.equal(after.kind === "loaded" && after.job.status, "WAITING_REVIEW", "an acknowledged receipt never re-transitions the job");
+  if (after.kind === "loaded") {
+    assert.equal(after.job.continuation.allowed, false, "the worker stays disarmed after the duplicate approval ack");
+    assert.equal(after.job.updated_at, pausedUpdatedAt, "no job write occurred during the duplicate acknowledgement");
+  }
+  assert.equal(readReviewDelivery(owner(), approved.delivery.id)?.state, "acknowledged");
+  assert.equal(readReviewDelivery(owner(), held.delivery.id)?.state, "acknowledged");
+  assert.equal(listPendingReviews(owner()).length, 0, "both receipts stay acknowledged and none is left pending");
+});

@@ -416,11 +416,11 @@ export function acknowledgeReview(loc: LedgerLocation, deliveryId: string, cwd: 
     return { ok: true, reason: "hold acknowledged; mission remains WAITING_REVIEW", job };
   }
   if (delivery.state === "acknowledged" && delivery.authority === "same-account") return { ok: true, reason: "same-account feedback was already recorded; Matthew's direction still governs", job };
-  if (delivery.state === "acknowledged" && job.status === "WAITING_REVIEW") {
-    const resumed = applyTransition(job, "WORKING");
-    const updated: JobState = { ...resumed, continuation: { ...job.continuation, allowed: true, reason: `authorized review decision: ${delivery.decision}` }, progress: { ...job.progress, next_action: delivery.decision === "changes_requested" ? "Address the authorized review feedback, then rerun required checks." : "Verify required checks and report the approved review outcome; do not merge." }, updated_at: now };
-    writeJob(loc, updated);
-    return { ok: true, reason: "reconciled acknowledged decision after restart", job: updated };
-  }
+  // An already-acknowledged receipt is a strict no-op on every valid job
+  // state: it never causes another mission-state transition. The job-first
+  // ordering above makes acknowledged-before-transition torn states
+  // unreachable, so no reconciliation may authorize a second transition — a
+  // retried approval can never override a hold acknowledged after it.
+  // Pending receipts still replay through the branches above.
   return { ok: true, reason: "review delivery was already acknowledged", job };
 }
