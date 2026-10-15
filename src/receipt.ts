@@ -148,11 +148,25 @@ function alreadyComplete(job: JobState): string {
   return bits.length ? bits.join("\n") : "no durable work completed yet; repository state is unchanged";
 }
 
+/**
+ * Newest authorised human direction first: it governs the older plan, while
+ * the contract's constraints, authority, acceptance and rules still bind.
+ */
+function directionLines(job: JobState): string[] {
+  const latest = job.directions[job.directions.length - 1];
+  if (!latest) return [];
+  return [
+    `LATEST HUMAN DIRECTION (${latest.mode} at ${latest.at}): ${latest.text}`,
+    `HUMAN DIRECTION GOVERNS (${job.directions.length} recorded): Matthew's newest direction supersedes older plans where they conflict. Constraints, authority, acceptance and rules still bind; a direction is never reviewer approval.`,
+  ];
+}
+
 /** The compact contract shown to the model so it can work without the chat. */
 export function renderMissionBrief(job: JobState): string {
   const lines = [
     `STUDIO MISSION ${job.job_id} [${job.status}]`,
     `OBJECTIVE: ${job.objective}`,
+    ...directionLines(job),
     job.scope.length ? `SCOPE: ${job.scope.join(" | ")}` : "",
     job.authority.length ? `AUTHORITY: ${job.authority.join(" | ")}` : "",
     job.constraints.length ? `CONSTRAINTS: ${job.constraints.join(" | ")}` : "",

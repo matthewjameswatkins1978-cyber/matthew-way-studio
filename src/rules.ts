@@ -144,6 +144,13 @@ export const MATTHEW_WAY_RULES: readonly RuleDefinition[] = [
     status: "active",
     statement: "When sources disagree, prefer the live owner of that fact: Git/repository for implementation state and Lantern for remembered context/provenance. A Tethers decision, when present, owns deterministic consequential authority; its absence never becomes permission. Preserve meaningful disagreement instead of guessing.",
   },
+  {
+    key: "autonomy.human-direction-governs",
+    revision: 1,
+    category: "autonomy",
+    status: "active",
+    statement: "Matthew's newest genuine direction outranks older plans and Studio's workflow preferences. Record a change of direction durably with a verbatim quote from his own current message, keep evidence, history, constraints and authority intact, and never treat a human direction as reviewer approval or permission to merge.",
+  },
 ];
 
 function canonicalEntries(entries: readonly RuleSnapshotEntry[]): RuleSnapshotEntry[] {

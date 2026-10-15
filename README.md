@@ -33,6 +33,7 @@ pi --extension .\extensions\index.ts
 | Explicit "plan only", "read only", or approval hold | Records the packet and plan, then remains idle until an ordinary go-ahead or optional `/studio start` |
 | Small request | Stays ordinary work. No project is manufactured |
 | Small mistake / crossed wire | Studio prefers live authoritative truth, records a soft reconciliation, and carries on without creating a new mission or asking Matthew unnecessarily |
+| "I've changed my mind — do this instead", "stop that and work on this", "pause this until I tell you otherwise" | Recorded durably as a human direction (`studio_steer`): the newest direction governs, evidence/history/contract survive it, and a redirect out of a review wait is a human override — never reviewer approval |
 | End of a turn while `WORKING` | Checkpoints, decides the next action, requests the next turn automatically |
 | Genuinely human-only dependency | `NEEDS_HUMAN`: what is needed, why, what is already complete, repo/branch/SHA, next action. Ambiguous `other` / external-service blockers must show a safe reconciliation or reroute attempt first |
 | Ordinary reply to a blocker | Rechecks the real capability instead of trusting the wording, then resumes |
@@ -75,6 +76,7 @@ Registered on Pi's ordinary tool surface. Matthew never names them.
   force-pushes, never merges review branches on Matthew or Lucy's behalf.
 - `studio_complete` — evidence-gated `COMPLETE | PARTIAL | FAILED` + receipt.
 - `studio_status` — read the durable mission after compaction or restart.
+- `studio_steer` — record an authorised human direction (pause / redirect / resume), quoted verbatim from Matthew's own current message in this turn. Works from WORKING, WAITING_REVIEW and NEEDS_HUMAN; releases a review wait only as a human override, never as reviewer approval; never reopens a closed mission.
 - `studio_context` — narrow Lantern retrieval with honest degradation.
 
 ## Forgiving at the edge, strict at the effect
@@ -126,6 +128,7 @@ Put overrides in `<git-common-dir>/matthew-way-studio/config.json`.
 - A new message from Matthew is external steering, not spinning, so it clears
   the no-progress and error streaks without resetting the run allowance.
 - "stop the mission" and "resume the mission" are ordinary sentences.
+- A genuine change of direction in ordinary language is recorded durably — with Matthew's verbatim words, provenance-checked against his own current message — instead of being matched by a phrase list. The newest direction supersedes older plans (constraints, authority, acceptance and rules still bind), and pausing holds work at the next safe boundary.
 - Projects that are not trusted stay idle; nothing is written before trust.
 
 ## Layout
@@ -138,6 +141,7 @@ src/paths.ts          git common dir resolution, command runner
 src/git.ts            repo facts, remote SHA verification, push, commit
 src/packet.ts         packet classification and contract compilation (pure)
 src/mission.ts        every legal transition, completion gate, reconciliation (pure)
+src/direction.ts      authorised human directions: verbatim quote validation, pause/redirect/resume (pure)
 src/rules.ts          canonical versioned rules, supersession + pinned snapshots
 src/continuation.ts   stop-loss and run allowance decision (pure)
 src/receipt.ts        NEEDS_HUMAN block, completion receipt, mission brief

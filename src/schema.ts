@@ -12,7 +12,7 @@
 
 import { currentRuleSnapshot, legacyRuleSnapshot, parseRuleSnapshot, type RuleSnapshot } from "./rules.js";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 export const STATUSES = ["WORKING", "WAITING_REVIEW", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"] as const;
 export type JobStatus = (typeof STATUSES)[number];
@@ -146,6 +146,32 @@ export interface ReviewWaitTarget {
   requested_review: "general" | "approval" | "correction";
   requested_at: string;
 }
+
+/**
+ * One authorised human direction (see src/direction.ts). Stored newest-last:
+ * the newest direction governs, older ones stay on the record.
+ */
+export type DirectionMode = "pause" | "redirect" | "resume";
+
+export const DIRECTION_MODES: readonly DirectionMode[] = ["pause", "redirect", "resume"];
+
+/** Longest direction quote accepted on the durable record. */
+export const MAX_DIRECTION_TEXT = 600;
+
+/** How many directions stay on the record; the newest ones win. */
+export const MAX_DIRECTIONS = 20;
+
+export interface HumanDirection {
+  /** Verbatim words from Matthew's own message, never a paraphrase. */
+  text: string;
+  mode: DirectionMode;
+  at: string;
+  /** Mission status at the moment the direction was given. */
+  from_status: JobStatus;
+  /** What the direction did, including any human-override caveat. */
+  note: string;
+}
+
 export interface JobState extends JobContract {
   schema_version: number;
   job_id: string;
@@ -158,6 +184,8 @@ export interface JobState extends JobContract {
   memory: JobMemory;
   blocker?: JobBlocker;
   review_wait?: ReviewWaitTarget;
+  /** Newest last. Authorised human directions; history is never rewritten. */
+  directions: HumanDirection[];
   human_dogfood: JobDogfood;
   continuation: JobContinuation;
   /** Exact operating rules pinned when the mission began. */
@@ -249,6 +277,23 @@ function normalizeReviewWait(value: unknown): ReviewWaitTarget | undefined {
   }
   return target;
 }
+
+/** Newest last. Malformed entries are dropped rather than guessed at. */
+function normalizeDirections(value: unknown, now: string): HumanDirection[] {
+  if (!Array.isArray(value)) return [];
+  const out: HumanDirection[] = [];
+  for (const raw of value) {
+    if (typeof raw !== "object" || raw === null) continue;
+    const entry = raw as Record<string, unknown>;
+    const mode = str(entry.mode) as DirectionMode;
+    const text = str(entry.text).trim();
+    const from = str(entry.from_status) as JobStatus;
+    if (!DIRECTION_MODES.includes(mode) || !text || !STATUSES.includes(from)) continue;
+    out.push({ at: str(entry.at) || now, mode, text: text.slice(0, MAX_DIRECTION_TEXT), from_status: from, note: str(entry.note) });
+  }
+  return out.slice(-MAX_DIRECTIONS);
+}
+
 export function normalizeJob(raw: unknown): JobState {
   if (typeof raw !== "object" || raw === null) throw new JobParseError("job state is not an object");
   const obj = raw as Record<string, unknown>;
@@ -291,6 +336,7 @@ export function normalizeJob(raw: unknown): JobState {
     ...(typeof obj.worker_session_id === "string" && obj.worker_session_id ? { worker_session_id: obj.worker_session_id } : {}),
     status,
     ...(obj.review_wait === undefined ? {} : { review_wait: normalizeReviewWait(obj.review_wait) }),
+    directions: normalizeDirections(obj.directions, now),
     objective: str(obj.objective),
     scope: strList(obj.scope),
     authority: strList(obj.authority),
@@ -386,10 +432,17 @@ export function normalizeJob(raw: unknown): JobState {
     };
   }
 
-  if (job.review_wait && (job.review_wait.job_id !== job.job_id || job.review_wait.branch !== job.repo.branch || job.review_wait.head_sha.toLowerCase() !== job.repo.current_sha.toLowerCase())) {
-    throw new JobParseError("review_wait identity does not match its job, branch and current head SHA");
+  // Job identity always binds; branch/SHA identity binds while the wait is
+  // ACTIVE. Once a wait is released (human recovery, a human direction) it is
+  // history: its recorded head may legitimately lag the checkout, and the
+  // ledger must stay readable so the newest direction survives a restart.
+  if (job.review_wait && job.review_wait.job_id !== job.job_id) throw new JobParseError("review_wait belongs to a different job");
+  if (job.status === "WAITING_REVIEW") {
+    if (!job.review_wait) throw new JobParseError("WAITING_REVIEW has no exact review target");
+    if (job.review_wait.branch !== job.repo.branch || job.review_wait.head_sha.toLowerCase() !== job.repo.current_sha.toLowerCase()) {
+      throw new JobParseError("review_wait identity does not match its job, branch and current head SHA");
+    }
   }
-  if (job.status === "WAITING_REVIEW" && !job.review_wait) throw new JobParseError("WAITING_REVIEW has no exact review target");
   if (!job.objective) throw new JobParseError("job state has no objective");
   return job;
 }
@@ -412,6 +465,7 @@ export function newJob(input: {
     progress: { milestone: "", next_action: input.nextAction, attempts: 0, child_work: "", reconciliations: [] },
     evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [], human_confirmed: [] },
     memory: { lantern: "not-needed", lantern_refs: [], decisions_loaded: [] },
+    directions: [],
     human_dogfood: { status: "none", checks: [] },
     continuation: {
       allowed: true,

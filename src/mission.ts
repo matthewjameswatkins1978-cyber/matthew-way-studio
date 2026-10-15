@@ -113,6 +113,7 @@ export function startMission(input: {
     },
     evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [], human_confirmed: [] },
     memory: { lantern: "not-needed", lantern_refs: [], decisions_loaded: [] },
+    directions: [],
     human_dogfood: { status: "none", checks: [] },
     continuation: { allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, last_signature: "", reason: "mission seeded" },
     rules: currentRuleSnapshot(),

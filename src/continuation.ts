@@ -125,6 +125,8 @@ function buildContinuationInstruction(job: JobState, cont: JobContinuation, prog
     progressed ? "Previous turn made measurable progress. Keep going." : "Previous turn changed nothing measurable. Do not repeat the same action: inspect live truth, repair any crossed wire, change approach, or record a checkpoint. Spend Matthew's attention only on a genuinely human-owned dependency.",
     `OBJECTIVE: ${job.objective}`,
   ];
+  const latest = job.directions[job.directions.length - 1];
+  if (latest) lines.push(`LATEST HUMAN DIRECTION (${latest.mode}): ${latest.text} — this supersedes the objective and plan above where they conflict; constraints and acceptance still bind.`);
   if (job.progress.milestone) lines.push(`CURRENT MILESTONE: ${job.progress.milestone}`);
   if (job.progress.next_action) lines.push(`NEXT ACTION: ${job.progress.next_action}`);
   if (job.acceptance.length) lines.push(`ACCEPTANCE STILL OPEN: ${remainingAcceptance(job).join(" | ") || "verify each acceptance item against the repository"}`);
