@@ -6,7 +6,7 @@ import { run } from "./paths.js";
 import { readJob, writeJob } from "./ledger.js";
 import type { LedgerLocation } from "./paths.js";
 import { applyTransition, normalizeJob, type JobState } from "./schema.js";
-import { applyBlock } from "./mission.js";
+import { applyBlock, blockerSignature, type BlockerInput } from "./mission.js";
 
 export interface PullRequestSnapshot {
   repository: string;
@@ -310,14 +310,38 @@ export function listPendingReviews(loc: LedgerLocation): ReviewDelivery[] {
   return out;
 }
 
-/** Idempotently acknowledge exactly one pending delivery; no merge authority is represented. */
-export function acknowledgeReview(loc: LedgerLocation, deliveryId: string, cwd: string, now = new Date().toISOString(), jobReader: typeof readPullRequest = readPullRequest): { ok: boolean; reason: string; job?: JobState } {
+/**
+ * Idempotently acknowledge exactly one pending delivery; no merge authority is represented.
+ *
+ * Durable ordering: when an acknowledgement both transitions the job and
+ * records a receipt, the job snapshot is written first and the receipt second.
+ * A crash between the two therefore always leaves a *pending* receipt over an
+ * already-transitioned job, and a replayed acknowledgement re-derives the same
+ * transition (status self-edges are legal) before completing the receipt. A
+ * receipt only becomes "acknowledged" after the state it authorizes is durable,
+ * so an acknowledged receipt never needs a second write to become true.
+ *
+ * interruptAfterJobWrite is a test-only fault barrier invoked exactly between
+ * those two writes, so the crash/restart regressions interrupt the real code
+ * path instead of hand-assembling a torn state.
+ */
+export function acknowledgeReview(loc: LedgerLocation, deliveryId: string, cwd: string, now = new Date().toISOString(), jobReader: typeof readPullRequest = readPullRequest, interruptAfterJobWrite?: () => void): { ok: boolean; reason: string; job?: JobState } {
   const delivery = readReviewDelivery(loc, deliveryId);
   if (!delivery || !loc.workerId) return { ok: false, reason: "delivery is missing or belongs to another worker" };
   const snap = readJob(loc);
   if (snap.kind !== "loaded") return { ok: false, reason: "owning job is unavailable" };
   const job = snap.job;
-  if (job.job_id !== delivery.job_id || job.worker_session_id !== loc.workerId || (job.status !== "WAITING_REVIEW" && job.status !== "WORKING" && !(delivery.state === "acknowledged" && job.status === "NEEDS_HUMAN")) || job.review_wait?.worker_session_id !== loc.workerId || job.review_wait.repository !== delivery.repository || job.review_wait.pull_request !== delivery.pull_request || job.review_wait.head_sha !== delivery.head_sha) {
+  // The exact park this delivery owes, recomputed verbatim on replay: a crash
+  // after the park write and before the receipt write is recognized as "this
+  // park already landed" instead of being mistaken for an unrelated blocker.
+  const parkBlocker: BlockerInput = {
+    kind: "external-approval",
+    reason: `review feedback arrived under a shared worker GitHub identity (@${delivery.author}), which cannot authorize resumption by itself`,
+    exact_human_need: `review the queued feedback from @${delivery.author} on PR #${delivery.pull_request} and say how to proceed`,
+    resume_condition: "Matthew states the next action for this mission.",
+  };
+  const parkedForThisDelivery = delivery.authority === "same-account" && delivery.state === "pending" && delivery.decision !== "hold" && job.status === "NEEDS_HUMAN" && job.blocker?.signature === blockerSignature(parkBlocker);
+  if (job.job_id !== delivery.job_id || job.worker_session_id !== loc.workerId || (job.status !== "WAITING_REVIEW" && job.status !== "WORKING" && !((delivery.state === "acknowledged" || parkedForThisDelivery) && job.status === "NEEDS_HUMAN")) || job.review_wait?.worker_session_id !== loc.workerId || job.review_wait.repository !== delivery.repository || job.review_wait.pull_request !== delivery.pull_request || job.review_wait.head_sha !== delivery.head_sha) {
     return { ok: false, reason: "job, worker, PR or head SHA no longer matches the delivery" };
   }
   // An already-acknowledged delivery stays idempotent even after its job left the wait (parked for Matthew); a pending delivery never acts outside the wait.
@@ -327,46 +351,68 @@ export function acknowledgeReview(loc: LedgerLocation, deliveryId: string, cwd: 
   // A same-GitHub-identity comment is feedback, not reviewer approval: it can
   // pause the mission for Matthew's eyes, but it never resumes work by itself.
   if (delivery.authority === "same-account" && delivery.state === "pending" && delivery.decision !== "hold") {
+    if (job.status === "WORKING") {
+      // Single write: the job was already resumed by an independent decision.
+      delivery.state = "acknowledged";
+      delivery.acknowledged_at = now;
+      writeAtomic(deliveryPath(loc, loc.workerId, deliveryId), delivery);
+      return { ok: true, reason: "same-account feedback recorded; mission already resumed by an independent decision", job };
+    }
+    // Order matters: the park is durable before the receipt that records it, so
+    // an interruption between the two leaves this receipt pending over the
+    // landed park, and replay (parkedForThisDelivery) completes the receipt
+    // without raising a second or foreign block.
+    const parked = parkedForThisDelivery ? job : applyBlock(job, parkBlocker);
+    if (!parkedForThisDelivery) {
+      writeJob(loc, parked);
+      interruptAfterJobWrite?.();
+    }
     delivery.state = "acknowledged";
     delivery.acknowledged_at = now;
     writeAtomic(deliveryPath(loc, loc.workerId, deliveryId), delivery);
-    if (job.status === "WORKING") return { ok: true, reason: "same-account feedback recorded; mission already resumed by an independent decision", job };
-    const parked = applyBlock(job, {
-      kind: "external-approval",
-      reason: `review feedback arrived under a shared worker GitHub identity (@${delivery.author}), which cannot authorize resumption by itself`,
-      exact_human_need: `review the queued feedback from @${delivery.author} on PR #${delivery.pull_request} and say how to proceed`,
-      resume_condition: "Matthew states the next action for this mission.",
-    });
-    writeJob(loc, parked);
     return { ok: true, reason: "same-account feedback parked for Matthew; not reviewer approval, no merge authority", job: parked };
   }
   if (delivery.state === "pending" && delivery.decision !== "hold") {
     const resumed = applyTransition(job, "WORKING");
     const updated: JobState = { ...resumed, continuation: { ...job.continuation, allowed: true, reason: `authorized review decision: ${delivery.decision}` }, progress: { ...job.progress, next_action: delivery.decision === "changes_requested" ? "Address the authorized review feedback, then rerun required checks." : "Verify required checks and report the approved review outcome; do not merge." }, updated_at: now };
-    delivery.state = "acknowledged";
-    delivery.acknowledged_at = now;
-    const file = deliveryPath(loc, loc.workerId, deliveryId);
-    writeAtomic(file, delivery);
+    // Order: resume durable first, receipt second (durable ordering above).
     writeJob(loc, updated);
-    return { ok: true, reason: "review acknowledged; mission resumed without merge authority", job: updated };
-  }
-  // A hold is never silently ignored or stranded: every hold receipt is
-  // marked acknowledged exactly once. The last independent decision governs:
-  // a later hold re-pauses work an earlier decision resumed. Same-account
-  // holds are recorded only; Matthew's direction still governs them.
-  if (delivery.decision === "hold" && delivery.state === "pending") {
+    interruptAfterJobWrite?.();
     delivery.state = "acknowledged";
     delivery.acknowledged_at = now;
     writeAtomic(deliveryPath(loc, loc.workerId, deliveryId), delivery);
+    return { ok: true, reason: "review acknowledged; mission resumed without merge authority", job: updated };
+  }
+  // A hold is never silently ignored or stranded: every hold receipt is
+  // marked acknowledged exactly once. The last *acknowledged* independent
+  // decision governs, not the newest GitHub comment: receipts for one job/head
+  // may be acknowledged in any order, so a hold acknowledged after an approval
+  // re-pauses work that approval resumed even when the hold comment is the
+  // older one (documented, tested limitation — see docs/review-decisions.md).
+  // Same-account holds are recorded only; Matthew's direction still governs them.
+  if (delivery.decision === "hold" && delivery.state === "pending") {
     if (delivery.authority !== "independent") {
+      // Single write: a same-account hold never transitions the job.
+      delivery.state = "acknowledged";
+      delivery.acknowledged_at = now;
+      writeAtomic(deliveryPath(loc, loc.workerId, deliveryId), delivery);
       return { ok: true, reason: "same-account hold recorded; Matthew's direction still governs", job };
     }
     if (job.status === "WORKING") {
       const paused = applyTransition(job, "WAITING_REVIEW");
       const updated: JobState = { ...paused, continuation: { ...job.continuation, allowed: false, reason: "authorized review hold after resumption" }, updated_at: now };
+      // Order: re-pause durable first, receipt second (durable ordering above).
       writeJob(loc, updated);
+      interruptAfterJobWrite?.();
+      delivery.state = "acknowledged";
+      delivery.acknowledged_at = now;
+      writeAtomic(deliveryPath(loc, loc.workerId, deliveryId), delivery);
       return { ok: true, reason: "hold acknowledged; mission re-paused awaiting reviewer", job: updated };
     }
+    // Single write: the job is already WAITING_REVIEW.
+    delivery.state = "acknowledged";
+    delivery.acknowledged_at = now;
+    writeAtomic(deliveryPath(loc, loc.workerId, deliveryId), delivery);
     return { ok: true, reason: "hold acknowledged; mission remains WAITING_REVIEW", job };
   }
   if (delivery.state === "acknowledged" && delivery.authority === "same-account") return { ok: true, reason: "same-account feedback was already recorded; Matthew's direction still governs", job };
