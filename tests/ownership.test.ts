@@ -291,3 +291,173 @@ test("review recovery works for the owning session and is refused for a detached
   assert.equal(rawActive(second.dir), before, "the wait and its mission are unchanged");
   assert.ok(!readEvents(shared, 100).some((e) => e.type === "review-wait-recovery"), "no recovery was recorded");
 });
+
+// ------------------------------------------- Lucy review boundary regressions
+
+test("a detached session's fresh mission is attached to it from the start", async () => {
+  for (const duringWait of [false, true]) {
+    const { dir } = tempRepo();
+    const loc = ledgerLocation(dir);
+    if (duringWait) {
+      const waiting = makeWaitingJob(loc, dir, "worker-w");
+      writeJob(loc, waiting);
+    }
+    const stranger = makeHarness();
+    registerStudio(stranger.api);
+    const ctx = ctxFor(dir, stranger);
+    await emit(stranger, "session_start", { type: "session_start", reason: "new" }, ctx);
+    await emit(stranger, "before_agent_start", startEvent(packetFor("Build the cache layer for the ingest pipeline.")), ctx);
+    const fresh = readJob(loc);
+    assert.equal(fresh.kind, "loaded");
+    if (fresh.kind !== "loaded") continue;
+    assert.equal(fresh.job.status, "WORKING", `fresh mission seeded (duringWait=${duringWait})`);
+
+    const checkpoint = await stranger.tools.get("studio_checkpoint")!.execute("a1", { checks: [{ name: "suite", status: "pass" }] }, undefined, undefined, ctx);
+    assert.equal(checkpoint.isError ?? false, false, `the creating session checkpoints its own mission (duringWait=${duringWait}): ${checkpoint.content[0]?.text ?? ""}`);
+    const after = readJob(loc);
+    assert.equal(after.kind === "loaded" && after.job.evidence.checks.length, 1, "the checkpoint landed on the fresh mission");
+    const boundary = await emit(stranger, "agent_before_settle", { type: "agent_before_settle", outcome: "completed", entries: [], continue: false, context: { canContinue: false } }, ctx);
+    assert.ok(boundary && (boundary as any).continue === true, `continuation works for the fresh mission (duringWait=${duringWait})`);
+  }
+});
+
+test("detached lifecycle writes are bounded to the intentional emergency stop", async () => {
+  // Emergency stop: a shared mission without a foreign owner can be disarmed
+  // from another session, but nothing else about it changes.
+  const first = tempRepo();
+  const owner = makeHarness();
+  registerStudio(owner.api);
+  const ownerCtx = ctxFor(first.dir, owner);
+  await emit(owner, "before_agent_start", startEvent(packetFor("Add the status file to the repository.")), ownerCtx);
+  await owner.tools.get("studio_checkpoint")!.execute("e0", { milestone: "M1" }, undefined, undefined, ownerCtx);
+  const beforeJob = readJob(ledgerLocation(first.dir));
+  assert.equal(beforeJob.kind, "loaded");
+  if (beforeJob.kind !== "loaded") return;
+  const stranger = makeHarness();
+  registerStudio(stranger.api);
+  const strangerCtx = ctxFor(first.dir, stranger);
+  await emit(stranger, "session_start", { type: "session_start", reason: "new" }, strangerCtx);
+  await emit(stranger, "before_agent_start", startEvent("stop the mission for now"), strangerCtx);
+  const after = readJob(ledgerLocation(first.dir));
+  assert.equal(after.kind === "loaded" && after.job.continuation.allowed, false, "the emergency stop disarms the loop");
+  if (after.kind !== "loaded") return;
+  assert.deepEqual({ ...after.job, continuation: beforeJob.job.continuation, updated_at: beforeJob.job.updated_at }, beforeJob.job, "only continuation state changes");
+  assert.ok(readEvents(ledgerLocation(first.dir), 100).some((e) => e.type === "paused" && e.from_detached_session === true), "the cross-session stop is recorded explicitly");
+
+  // A foreign worker's mission is protected even from the emergency stop.
+  const second = tempRepo();
+  const foreignLoc = ledgerLocation(second.dir);
+  const foreign = startMission({ packet: packetFor("Add the status file to the repository."), location: foreignLoc, facts: repoFacts(second.dir) });
+  writeJob(foreignLoc, { ...foreign, worker_session_id: "someone-elses-session" });
+  const foreignBefore = rawActive(second.dir);
+  const intruder = makeHarness();
+  registerStudio(intruder.api);
+  const intruderCtx = ctxFor(second.dir, intruder);
+  await emit(intruder, "session_start", { type: "session_start", reason: "new" }, intruderCtx);
+  await emit(intruder, "before_agent_start", startEvent("stop the mission for now"), intruderCtx);
+  assert.equal(rawActive(second.dir), foreignBefore, "a foreign mission is untouched by the stop");
+  assert.ok(!readEvents(foreignLoc, 100).some((e) => e.type === "paused"), "no pause event for a foreign mission");
+
+  // session_shutdown from a detached session never rewrites the mission.
+  const third = tempRepo();
+  const thirdLoc = ledgerLocation(third.dir);
+  const owner3 = makeHarness();
+  registerStudio(owner3.api);
+  const owner3Ctx = ctxFor(third.dir, owner3);
+  await emit(owner3, "before_agent_start", startEvent(packetFor("Add the status file to the repository.")), owner3Ctx);
+  const shutdownBefore = rawActive(third.dir);
+  const eventsBefore = readEvents(thirdLoc, 100).length;
+  const stranger3 = makeHarness();
+  registerStudio(stranger3.api);
+  const stranger3Ctx = ctxFor(third.dir, stranger3);
+  await emit(stranger3, "session_start", { type: "session_start", reason: "new" }, stranger3Ctx);
+  await emit(stranger3, "session_shutdown", { type: "session_shutdown", reason: "quit" }, stranger3Ctx);
+  assert.equal(rawActive(third.dir), shutdownBefore, "a detached shutdown leaves the mission byte-identical");
+  assert.equal(readEvents(thirdLoc, 100).length, eventsBefore, "no session-shutdown event from a detached session");
+});
+
+test("a detached run never consumes allowance even with stale session flags", async () => {
+  const { dir } = tempRepo();
+  const owner = makeHarness();
+  registerStudio(owner.api);
+  const ownerCtx = ctxFor(dir, owner);
+  await emit(owner, "before_agent_start", startEvent(packetFor("Add the status file to the repository.")), ownerCtx);
+  // The owner's run leaves the shared legacy runOwned flag set to true.
+  const stranger = makeHarness();
+  registerStudio(stranger.api);
+  const strangerCtx = ctxFor(dir, stranger);
+  await emit(stranger, "session_start", { type: "session_start", reason: "new" }, strangerCtx);
+  const before = rawActive(dir);
+  const boundary = await emit(stranger, "agent_before_settle", { type: "agent_before_settle", outcome: "completed", entries: [], continue: false, context: { canContinue: false } }, strangerCtx);
+  assert.equal(boundary, undefined, "no automatic continuation for a detached run");
+  assert.equal(rawActive(dir), before, "allowance and stop-loss counters are untouched");
+});
+
+test("status rendering uses true attachment through agent_end", async () => {
+  const { dir } = tempRepo();
+  const owner = makeHarness();
+  registerStudio(owner.api);
+  const ownerCtx = ctxFor(dir, owner);
+  await emit(owner, "before_agent_start", startEvent(packetFor("Add the status file to the repository.")), ownerCtx);
+  const stranger = makeHarness();
+  registerStudio(stranger.api);
+  const strangerCtx = ctxFor(dir, stranger);
+  await emit(stranger, "session_start", { type: "session_start", reason: "new" }, strangerCtx);
+  await emit(stranger, "agent_end", { type: "agent_end", messages: [] }, strangerCtx);
+  const shown = [...stranger.status].reverse().find((s) => s !== undefined) ?? "";
+  assert.match(shown, /idle|parked/, "a detached conversation shows the mission as history");
+  assert.doesNotMatch(shown, /^studio: WORKING/, "the old mission is never displayed as current work");
+});
+
+test("explicit resume attaches to a parked review wait without releasing it", async () => {
+  const { dir } = tempRepo();
+  const loc = ledgerLocation(dir);
+  const waiting = makeWaitingJob(loc, dir, "worker-w");
+  writeJob(loc, waiting);
+  const stranger = makeHarness();
+  registerStudio(stranger.api);
+  const ctx = ctxFor(dir, stranger);
+  await emit(stranger, "session_start", { type: "session_start", reason: "new" }, ctx);
+  const before = rawActive(dir);
+  await emit(stranger, "before_agent_start", startEvent("resume the mission"), ctx);
+  assert.equal(rawActive(dir), before, "attachment alone never rewrites the waiting mission");
+  const events = readEvents(loc, 100);
+  assert.ok(events.some((e) => e.type === "review-wait-attached"), "the attachment is recorded");
+  assert.ok(!events.some((e) => e.type === "review-wait-recovery"), "attachment is not wait recovery");
+  const job = readJob(loc);
+  assert.equal(job.kind === "loaded" && job.job.status, "WAITING_REVIEW", "the review wait remains in force");
+
+  const follow = startEvent("what is the current status");
+  await emit(stranger, "before_agent_start", follow, ctx);
+  assert.match(follow.systemPromptOptions.sections?.["studio_mission"] ?? "", /WAITING_REVIEW/, "the attached session sees the review wait as current work");
+
+  // After attachment the session's own authorised recovery works as before.
+  await emit(stranger, "before_agent_start", startEvent("cancel review wait"), ctx);
+  const released = readJob(loc);
+  assert.equal(released.kind === "loaded" && released.job.status, "WORKING", "the attached session's recovery releases the wait");
+});
+
+test("explicit resume never attaches a foreign worker's review wait", async () => {
+  const { dir } = tempRepo();
+  const loc = ledgerLocation(dir);
+  const foreign = startMission({ packet: packetFor("Wait for review on the status file."), location: loc, facts: repoFacts(dir) });
+  const waiting = applyReviewWait(foreign, {
+    repository: "matthewjameswatkins1978-cyber/matthew-way-studio",
+    pull_request: 7,
+    url: "https://example.test/pull/7",
+    branch: foreign.repo.branch,
+    head_sha: foreign.repo.current_sha.toLowerCase(),
+    worker_session_id: "foreign-owner",
+    requested_review: "general",
+  });
+  writeJob(loc, { ...waiting, worker_session_id: "foreign-owner" });
+  const before = rawActive(dir);
+  const stranger = makeHarness();
+  registerStudio(stranger.api);
+  const ctx = ctxFor(dir, stranger);
+  await emit(stranger, "session_start", { type: "session_start", reason: "new" }, ctx);
+  await emit(stranger, "before_agent_start", startEvent("resume the mission"), ctx);
+  assert.equal(rawActive(dir), before, "the foreign review wait is untouched");
+  assert.ok(!readEvents(loc, 100).some((e) => e.type === "review-wait-attached"), "no attach to a foreign mission");
+  assert.ok(stranger.notifications.some((n) => n.includes("refusing")), "the refusal is announced");
+});
