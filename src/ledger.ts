@@ -61,7 +61,7 @@ export function adoptLegacyJob(loc: LedgerLocation, expectedJobId: string): Lega
   const legacy = readLegacySnapshot(loc);
   if (legacy.kind !== "loaded") return { ok: false, reason: "no adoptable legacy mission snapshot" };
   if (legacy.job.job_id !== expectedJobId) return { ok: false, reason: "legacy job id does not match the expected mission" };
-  if (legacy.job.worker_session_id && legacy.job.worker_session_id !== loc.workerId) {
+  if (claimIsForeign(legacy.job.worker_session_id, loc.workerId, undefined)) {
     return { ok: false, reason: "legacy mission already belongs to another worker" };
   }
   if (fs.existsSync(activeJobPath(loc))) return { ok: false, reason: "this worker already has an active mission" };
@@ -165,6 +165,41 @@ export function writeJob(loc: LedgerLocation, job: JobState, options: WriteOptio
 export function clearJob(loc: LedgerLocation): void {
   const file = activeJobPath(loc);
   if (fs.existsSync(file)) fs.rmSync(file, { force: true });
+}
+
+/**
+ * Sessions without a stable Pi session id get a synthesised claim that is
+ * unique per process. It is recorded on the missions they create so any other
+ * session can tell a live writable mission from shared history.
+ */
+export function makeSessionToken(): string {
+  return `legacy:${process.pid}:${randomUUID().slice(0, 8)}`;
+}
+
+function claimProcessAlive(claim: string): boolean {
+  const pid = Number(claim.split(":")[1]);
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Ownership of a mission claim. A claim naming this session (stable worker id
+ * or synthesised token) is mine. A legacy claim whose process is gone is
+ * inheritable: nobody can be writing that mission. Anything else is somebody
+ * else's writable mission and must stay read-only here.
+ */
+export function claimIsForeign(claim: string | undefined, workerId: string | undefined, sessionToken: string | undefined): boolean {
+  if (!claim) return false;
+  if (workerId && claim === workerId) return false;
+  if (sessionToken && claim === sessionToken) return false;
+  if (claim.startsWith("legacy:") && !claimProcessAlive(claim)) return false;
+  return true;
 }
 
 export function stateSnapshotPath(loc: LedgerLocation, jobId: string): string {

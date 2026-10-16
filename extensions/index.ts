@@ -21,7 +21,7 @@ import type {
 } from "../src/pi-shim.js";
 import { customMessage, textResult } from "../src/pi-shim.js";
 import { ledgerLocation, run, type LedgerLocation } from "../src/paths.js";
-import { adoptLegacyJob, appendEvent, readJob, readLegacySnapshot, writeJob, readPacket, saveJobSnapshot, listJobSnapshots, type JobReadResult } from "../src/ledger.js";
+import { adoptLegacyJob, appendEvent, claimIsForeign, readJob, readLegacySnapshot, writeJob, readPacket, saveJobSnapshot, listJobSnapshots, makeSessionToken, type JobReadResult } from "../src/ledger.js";
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
@@ -78,6 +78,10 @@ function jobOf(rt: Runtime): JobState | undefined {
 interface SessionState {
   sessionStartReason?: string;
   attachedOverride: boolean;
+  /** Synthesised claim for sessions without a stable Pi session id. */
+  sessionToken: string;
+  /** The exact mission this session instance created or adopted. */
+  boundJobId?: string;
   runUser: boolean;
   runOwned: boolean;
   humanSinceBlock: boolean;
@@ -89,7 +93,7 @@ function stateFor(ctx: PiContext | PiToolContext): SessionState {
   const key = `${ctx.cwd}\0${ctx.sessionManager?.getSessionId?.() ?? "legacy"}`;
   let state = sessionStates.get(key);
   if (!state) {
-    state = { attachedOverride: false, runUser: true, runOwned: true, humanSinceBlock: false };
+    state = { attachedOverride: false, sessionToken: makeSessionToken(), runUser: true, runOwned: true, humanSinceBlock: false };
     sessionStates.set(key, state);
   }
   return state;
@@ -102,7 +106,12 @@ function stateFor(ctx: PiContext | PiToolContext): SessionState {
  * reason "new") is detached until Matthew explicitly resumes or replaces the
  * mission. Anything else may be the same thread after a restart.
  */
-function missionAttached(rt: Runtime, state: SessionState): boolean {
+function missionAttached(rt: Runtime, state: SessionState, job: JobState): boolean {
+  // A session instance is bound to the exact mission it created or adopted,
+  // so replacing the shared slot never silently re-assigns ownership.
+  if (state.boundJobId) return state.boundJobId === job.job_id;
+  // A live foreign claim is somebody else's writable mission: never bind.
+  if (claimIsForeign(job.worker_session_id, rt.location.workerId, state.sessionToken)) return false;
   if (rt.location.workerId) return true;
   if (state.attachedOverride) return true;
   return state.sessionStartReason !== "new";
@@ -134,8 +143,9 @@ function missionRootFor(rt: Runtime, job: JobState | undefined, cwd: string): { 
 function detachedMissionRefusal(rt: Runtime, ctx: PiContext | PiToolContext, verb: string): string | undefined {
   const job = jobOf(rt);
   if (!job) return undefined;
-  const foreignWorker = Boolean(job.worker_session_id) && job.worker_session_id !== rt.location.workerId;
-  const detached = !missionAttached(rt, stateFor(ctx));
+  const state = stateFor(ctx);
+  const foreignWorker = claimIsForeign(job.worker_session_id, rt.location.workerId, state.sessionToken);
+  const detached = !missionAttached(rt, state, job);
   if (!foreignWorker && !detached) return undefined;
   return `studio: refusing to ${verb} mission ${job.job_id} (${job.status}): ${foreignWorker ? "it belongs to another Pi session" : "it is not attached to this session"}. This session may read it as history but never mutate or close it. Say \"resume the mission\" to attach first, or start independent work with a fresh packet.`;
 }
@@ -255,11 +265,22 @@ function seedMission(
   ctx: PiContext | PiToolContext,
   packet: string,
   opts: { parkReason?: string } = {},
-): { job?: JobState; rt: Runtime; started: boolean } {
+): { job?: JobState; rt: Runtime; started: boolean; refused?: string } {
   const rt = runtimeFor(ctx);
+  const state = stateFor(ctx);
   const existing = jobOf(rt);
   if (existing && !terminalStatus(existing.status) && !opts.parkReason) return { job: existing, rt, started: false };
   if (existing) {
+    // Never park or replace another live session's writable mission: the
+    // active slot belongs to its owner until that claim ends.
+    if (!terminalStatus(existing.status) && claimIsForeign(existing.worker_session_id, rt.location.workerId, state.sessionToken)) {
+      return {
+        job: existing,
+        rt,
+        started: false,
+        refused: `mission ${existing.job_id} (${existing.status}) is actively owned by another Pi session; refusing to park or replace it. Independent missions need a session with a stable identity, or wait until that claim ends.`,
+      };
+    }
     // The previous mission is parked as recoverable history: its full record
     // is preserved beside the packet before the active slot moves on.
     saveJobSnapshot(rt.location, existing);
@@ -272,6 +293,9 @@ function seedMission(
     });
   }
   const job = startMission({ packet, location: rt.location, facts: rt.facts });
+  // The claim is stamped before the record is written so every reader and
+  // every ownership gate sees it from the first byte on disk.
+  if (!job.worker_session_id) job.worker_session_id = state.sessionToken;
   if (requestsExecutionHold(packet)) {
     job.continuation = { ...job.continuation, allowed: false, reason: "execution held by packet" };
     job.progress.next_action = "Await explicit execution instruction.";
@@ -288,7 +312,8 @@ function seedMission(
   safeNotify(ctx, `studio: mission ${job.job_id} started — ${job.objective.slice(0, 80)}`, "info");
   // A newly created mission is owned by the session that created it, even when
   // that session started detached from whatever mission came before.
-  stateFor(ctx).attachedOverride = true;
+  state.attachedOverride = true;
+  state.boundJobId = job.job_id;
   return { job, rt, started: true };
 }
 
@@ -311,6 +336,7 @@ export function registerStudio(pi: PiApi): void {
     const state = stateFor(ctx);
     state.sessionStartReason = event.reason;
     state.attachedOverride = false;
+    state.boundJobId = undefined;
     // Ownership covers both attachment and worker identity: a foreign
     // worker's mission is never rendered as this session's current work.
     const attached = job ? !detachedMissionRefusal(rt, ctx, "render") : true;
@@ -386,6 +412,10 @@ export function registerStudio(pi: PiApi): void {
       // mission starts without carrying any review state.
       if (state.runUser && kind === "new-instruction" && prompt.trim().length >= rt.config.minPacketChars) {
         const seeded = seedMission(ctx, prompt, { parkReason: "new instruction during WAITING_REVIEW" });
+        if (seeded.refused) {
+          withSection(event, `STUDIO: ${seeded.refused} Work on the message directly with ordinary tools; nothing was recorded.`);
+          return undefined;
+        }
         if (seeded.job) {
           appendEvent(rt.location, "mission-switch", { from: job.job_id, to: seeded.job.job_id, during: "WAITING_REVIEW" });
           withSection(event, missionSection(seeded.job, rt.config));
@@ -400,13 +430,14 @@ export function registerStudio(pi: PiApi): void {
       // continuations ("go ahead") stay quiet, and another worker's job is
       // never touched. Recovery is a human override, never reviewer approval.
       if (isUserOrigin(event)) {
-        const foreignWait = Boolean(job.worker_session_id) && job.worker_session_id !== rt.location.workerId;
+        const foreignWait = claimIsForeign(job.worker_session_id, rt.location.workerId, state.sessionToken);
         const recovery = detectReviewRecoveryIntent(prompt);
-        if (!foreignWait && !missionAttached(rt, state) && explicitMissionResume(prompt)) {
+        if (!foreignWait && !missionAttached(rt, state, job) && explicitMissionResume(prompt)) {
           // Explicit owner-authorised ATTACHMENT to a parked review wait: the
           // session becomes the working owner without releasing the wait,
           // acknowledging any review or granting merge authority.
           state.attachedOverride = true;
+          state.boundJobId = job.job_id;
           appendEvent(rt.location, "review-wait-attached", { job_id: job.job_id, human_authorised: true });
           updateStatus(ctx, job, rt.config, true);
           safeNotify(ctx, `studio: attached to mission ${job.job_id}; the review wait remains in force (no release, no merge authority).`, "info");
@@ -414,7 +445,7 @@ export function registerStudio(pi: PiApi): void {
           return undefined;
         }
         if (recovery) {
-          if (foreignWait || !missionAttached(rt, state)) {
+          if (foreignWait || !missionAttached(rt, state, job)) {
             safeNotify(ctx, "studio: review wait belongs to another Pi session; refusing to recover it from here.", "warning");
           } else {
             try {
@@ -530,7 +561,7 @@ export function registerStudio(pi: PiApi): void {
       // A parked mission belongs to another conversation: report it clearly,
       // never fold this work into it and never continue it from here.
       state.runOwned = false;
-      const foreignMission = Boolean(job.worker_session_id) && job.worker_session_id !== rt.location.workerId;
+      const foreignMission = claimIsForeign(job.worker_session_id, rt.location.workerId, state.sessionToken);
       const intent = state.runUser ? detectControlIntent(prompt) : undefined;
       if (intent === "pause") {
         // Emergency stop: the one intentional cross-session write. It only
@@ -563,6 +594,7 @@ export function registerStudio(pi: PiApi): void {
         }
         // Explicit mission-level resume is the authorised attach.
         state.attachedOverride = true;
+        state.boundJobId = job.job_id;
         const reopened = job.status !== "WORKING" && canTransition(job.status, "WORKING");
         const resumed: JobState = {
           ...job,
@@ -580,6 +612,10 @@ export function registerStudio(pi: PiApi): void {
       }
       if (state.runUser && kind === "new-instruction" && prompt.trim().length >= rt.config.minPacketChars) {
         const seeded = seedMission(ctx, prompt, { parkReason: "replaced by a new instruction from another session" });
+        if (seeded.refused) {
+          withSection(event, `STUDIO: ${seeded.refused} Work on the message directly with ordinary tools; nothing was recorded.`);
+          return undefined;
+        }
         if (seeded.job) {
           state.runOwned = true;
           withSection(event, missionSection(seeded.job, rt.config));
@@ -1310,7 +1346,7 @@ export function registerStudio(pi: PiApi): void {
       const parkedHistory = listJobSnapshots(rt.location).filter((p) => p.job_id !== job.job_id);
       const lines = [
         renderMissionBrief(job),
-        `supervising: ${missionAttached(rt, stateFor(ctx)) ? "this session's current mission" : "NOT this session's mission (parked; do not continue it from here)"}`,
+        `supervising: ${!detachedMissionRefusal(rt, ctx, "render") ? "this session's current mission" : "NOT this session's mission (parked; do not continue it from here)"}`,
         `ledger: ${rt.location.dir} (${rt.location.source})`,
         ...(parkedHistory.length ? [`parked history: ${parkedHistory.map((p) => `${p.job_id} (${p.status})`).join(", ")}`] : []),
         `dirty now: ${rt.facts.dirty ? `${rt.facts.dirty_paths.length} path(s)` : "no"}`,
