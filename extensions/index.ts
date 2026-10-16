@@ -126,6 +126,21 @@ function missionRootFor(rt: Runtime, job: JobState | undefined, cwd: string): { 
 }
 
 /**
+ * Ownership gate for every state-mutating tool. A mission belongs to one
+ * session: a detached conversation, or a session that is not the recorded
+ * worker, may read the mission as history but must never mutate or close it
+ * just because a shared legacy ledger makes it readable.
+ */
+function detachedMissionRefusal(rt: Runtime, ctx: PiContext | PiToolContext, verb: string): string | undefined {
+  const job = jobOf(rt);
+  if (!job) return undefined;
+  const foreignWorker = Boolean(job.worker_session_id) && job.worker_session_id !== rt.location.workerId;
+  const detached = !missionAttached(rt, stateFor(ctx));
+  if (!foreignWorker && !detached) return undefined;
+  return `studio: refusing to ${verb} mission ${job.job_id} (${job.status}): ${foreignWorker ? "it belongs to another Pi session" : "it is not attached to this session"}. This session may read it as history but never mutate or close it. Say \"resume the mission\" to attach first, or start independent work with a fresh packet.`;
+}
+
+/**
  * The status line must never present old mission state as current activity.
  * It distinguishes a live mission this session owns, a parked mission that
  * belongs elsewhere, closed history, and no mission at all.
@@ -351,7 +366,19 @@ export function registerStudio(pi: PiApi): void {
     }
 
     if (job?.status === "WAITING_REVIEW") {
-      updateStatus(ctx, job, rt.config);
+      // A substantive new instruction is independent work: never a review
+      // decision and never wait recovery. The waiting mission is parked
+      // verbatim (identity, review wait and history intact) and the new
+      // mission starts without carrying any review state.
+      if (state.runUser && kind === "new-instruction" && prompt.trim().length >= rt.config.minPacketChars) {
+        const seeded = seedMission(ctx, prompt, { parkReason: "new instruction during WAITING_REVIEW" });
+        if (seeded.job) {
+          appendEvent(rt.location, "mission-switch", { from: job.job_id, to: seeded.job.job_id, during: "WAITING_REVIEW" });
+          withSection(event, missionSection(seeded.job, rt.config));
+        }
+        return undefined;
+      }
+      updateStatus(ctx, job, rt.config, attached);
       const pending = rt.location.workerId ? listPendingReviews(rt.location) : [];
       // Human recovery only: a genuine user message carrying the narrow
       // recovery vocabulary releases this worker's own wait when the review
@@ -361,7 +388,7 @@ export function registerStudio(pi: PiApi): void {
       if (isUserOrigin(event)) {
         const recovery = detectReviewRecoveryIntent(prompt);
         if (recovery) {
-          if (job.worker_session_id && job.worker_session_id !== rt.location.workerId) {
+          if ((job.worker_session_id && job.worker_session_id !== rt.location.workerId) || !missionAttached(rt, state)) {
             safeNotify(ctx, "studio: review wait belongs to another Pi session; refusing to recover it from here.", "warning");
           } else {
             try {
@@ -377,6 +404,17 @@ export function registerStudio(pi: PiApi): void {
             }
           }
         }
+      }
+      if (!attached) {
+        withSection(
+          event,
+          [
+            `STUDIO: parked mission ${job.job_id} (${job.status}) is not attached to this session.`,
+            "Do not report it as current work, do not continue it and do not act on its review wait from here. Work on the message directly with ordinary tools.",
+            "A message like \"resume the mission\" attaches and re-authorises it; a substantial new packet starts a new mission and parks the old one.",
+          ].join("\n"),
+        );
+        return undefined;
       }
       withSection(event, missionSection(job, rt.config, pending));
       return undefined;
@@ -644,6 +682,8 @@ export function registerStudio(pi: PiApi): void {
       const rt = runtimeFor(ctx);
       const job = jobOf(rt);
       if (!job) return textResult("No active Studio mission to place in review wait.", undefined, true);
+      const detachedWait = detachedMissionRefusal(rt, ctx, "place in review wait");
+      if (detachedWait) return textResult(detachedWait, { job_id: job.job_id, detached: true }, true);
       const sessionId = ctx.sessionManager?.getSessionId();
       if (!sessionId) return textResult("Cannot record WAITING_REVIEW: this Pi context does not expose a stable session ID.", undefined, true);
       const requestedReview = str(params["requested_review"]) ?? "general";
@@ -719,6 +759,8 @@ export function registerStudio(pi: PiApi): void {
     parameters: Type.Object({ delivery_id: Type.String({ description: "ID returned by studio_import_review" }) }),
     execute: async (_id, params, _signal, _update, ctx) => {
       const rt = runtimeFor(ctx);
+      const detachedAck = detachedMissionRefusal(rt, ctx, "acknowledge a review for");
+      if (detachedAck) return textResult(detachedAck, { detached: true }, true);
       const result = acknowledgeReview(rt.location, str(params["delivery_id"]) ?? "", ctx.cwd);
       if (!result.ok) return textResult(`Review acknowledgement refused: ${result.reason}.`, undefined, true);
       updateStatus(ctx, result.job, rt.config);
@@ -787,6 +829,8 @@ export function registerStudio(pi: PiApi): void {
       if (!job) {
         return textResult("No active Studio mission. Small jobs do not need one: just do the work. A substantial packet starts a mission automatically.", undefined, true);
       }
+      const detachedCheckpoint = detachedMissionRefusal(rt, ctx, "checkpoint");
+      if (detachedCheckpoint) return textResult(detachedCheckpoint, { job_id: job.job_id, detached: true }, true);
       // The authoritative repository association may be corrected explicitly
       // when the work lives in a dedicated worktree: validated first, recorded
       // in the append-only trail, never inferred from this session's cwd.
@@ -879,6 +923,8 @@ export function registerStudio(pi: PiApi): void {
       const rt = runtimeFor(ctx);
       const job = jobOf(rt);
       if (!job) return textResult("No active Studio mission to block.", undefined, true);
+      const detachedBlock = detachedMissionRefusal(rt, ctx, "block");
+      if (detachedBlock) return textResult(detachedBlock, { job_id: job.job_id, detached: true }, true);
       const kind = normalizeKind(str(params["kind"]));
       const input: BlockerInput = {
         kind,
@@ -959,6 +1005,8 @@ export function registerStudio(pi: PiApi): void {
     execute: async (_id, params, _signal, _update, ctx) => {
       const rt = runtimeFor(ctx);
       const job = jobOf(rt);
+      const detachedShip = detachedMissionRefusal(rt, ctx, "ship");
+      if (detachedShip) return textResult(detachedShip, { job_id: job?.job_id, detached: true }, true);
       // The mission's recorded repository is authoritative for every Git
       // operation; a missing worktree is a legible failure, not a silent
       // fallback to another directory.
@@ -1083,6 +1131,8 @@ export function registerStudio(pi: PiApi): void {
       const rt = runtimeFor(ctx);
       const job = jobOf(rt);
       if (!job) return textResult("No active Studio mission to complete.", undefined, true);
+      const detachedComplete = detachedMissionRefusal(rt, ctx, "complete");
+      if (detachedComplete) return textResult(detachedComplete, { job_id: job.job_id, detached: true }, true);
       const outcome = normalizeOutcome(str(params["outcome"]));
       const summary = str(params["summary"]) ?? "";
       const branchParam = str(params["branch"]);
@@ -1279,7 +1329,9 @@ export function registerStudio(pi: PiApi): void {
 
       const snapshot = readSnapshot(query, rt.config.lanternMirror ?? {});
       const result = lanternContextResult(mcpText, mcpError, snapshot);
-      if (job) {
+      // Retrieval is read-only; only the memory note touches the mission, so a
+      // detached session gets the context without mutating another mission.
+      if (job && !detachedMissionRefusal(rt, ctx, "record memory for")) {
         const remembered = applyMemory(job, { lantern: result.available ? "used" : "unavailable" });
         writeJob(rt.location, remembered);
         appendEvent(rt.location, "context-retrieval", {
