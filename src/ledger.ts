@@ -167,6 +167,47 @@ export function clearJob(loc: LedgerLocation): void {
   if (fs.existsSync(file)) fs.rmSync(file, { force: true });
 }
 
+export function stateSnapshotPath(loc: LedgerLocation, jobId: string): string {
+  return path.join(packetDir(loc, jobId), "state.json");
+}
+
+/**
+ * Park a full mission record beside its packet before the active slot moves
+ * on. History is preserved verbatim, so a parked or replaced mission stays
+ * recoverable and its evidence and authority state are never rewritten away.
+ */
+export function saveJobSnapshot(loc: LedgerLocation, job: JobState): string {
+  const file = stateSnapshotPath(loc, job.job_id);
+  writeFileAtomic(file, `${JSON.stringify(job, null, 2)}\n`);
+  return file;
+}
+
+export function readJobSnapshot(loc: LedgerLocation, jobId: string): JobReadResult {
+  const file = stateSnapshotPath(loc, jobId);
+  if (!fs.existsSync(file)) return { kind: "none" };
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    const job = normalizeJob(raw);
+    if (loc.workerId && job.worker_session_id && job.worker_session_id !== loc.workerId) return { kind: "none" };
+    return { kind: "loaded", job };
+  } catch (error) {
+    return { kind: "corrupt", reason: String(error) };
+  }
+}
+
+/** Parked missions, newest first, for status reporting and recovery. */
+export function listJobSnapshots(loc: LedgerLocation): JobState[] {
+  const dir = path.join(loc.dir, "jobs", ...(loc.workerKey ? [loc.workerKey] : []));
+  if (!fs.existsSync(dir)) return [];
+  const out: JobState[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const read = readJobSnapshot(loc, entry.name);
+    if (read.kind === "loaded") out.push(read.job);
+  }
+  return out.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+}
+
 /** Append one JSONL event. Never throws: telemetry must not break the run. */
 export function appendEvent(loc: LedgerLocation, type: string, data: Record<string, unknown>): void {
   try {

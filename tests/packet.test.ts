@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compilePacket, detectControlIntent, detectLegacyAdoptionIntent, detectReviewRecoveryIntent, isSubstantivePacket, looksLikeResumeAttempt, parseSections } from "../src/packet.js";
+import { createHash } from "node:crypto";
+import { classifyInstruction, compilePacket, detectControlIntent, detectLegacyAdoptionIntent, detectReviewRecoveryIntent, explicitMissionResume, isSubstantivePacket, looksLikeResumeAttempt, parseSections } from "../src/packet.js";
 import { requestsExecutionHold } from "../src/authority.js";
 
 const PACKET = `# DEMO
@@ -112,4 +113,32 @@ test("legacy adoption needs the words adopt and legacy plus an exact job id", ()
   assert.equal(detectLegacyAdoptionIntent("adopt job job-x"), undefined, "legacy must be named");
   assert.equal(detectLegacyAdoptionIntent("here is the legacy job job-x"), undefined, "adopt must be named");
   assert.equal(detectLegacyAdoptionIntent("thanks"), undefined);
+});
+
+test("classifyInstruction separates new work, duplicates, corrections and steering", () => {
+  const text = [
+    "# P",
+    "## OBJECTIVE",
+    "Add the status file to the repository.",
+    "## SCOPE",
+    "- one",
+    "## ACCEPTANCE",
+    "- done",
+    "Pad the packet with enough ordinary detail that a real harness treats it as a substantive mission rather than a one-line ask. ".repeat(4),
+  ].join("\n");
+  const sha = createHash("sha256").update(Buffer.from(text, "utf8")).digest("hex");
+  const active = { objective: compilePacket(text).objective, packetSha256: sha };
+  assert.equal(classifyInstruction(text, active), "duplicate", "the mission's own packet re-pasted is a duplicate");
+  assert.equal(classifyInstruction(text.replace("- one", "- two"), active), "correction", "same objective is a correction");
+  assert.equal(classifyInstruction(text.replace("Add the status file", "Build the cache layer"), active), "new-instruction", "a different objective is new work");
+  assert.equal(classifyInstruction("why is the sky blue", active), "steering");
+  assert.equal(classifyInstruction(text, undefined), "new-instruction", "without a live mission, a packet seeds one");
+});
+
+test("reopening closed work takes explicit mission-level resume language", () => {
+  assert.equal(explicitMissionResume("resume the mission and finish the item"), true);
+  assert.equal(explicitMissionResume("continue the studio job"), true);
+  assert.equal(explicitMissionResume("continue"), false, "bare continuation words are not enough");
+  assert.equal(explicitMissionResume("go ahead"), false);
+  assert.equal(explicitMissionResume("why is the sky blue"), false);
 });

@@ -32,11 +32,13 @@ pi --extension .\extensions\index.ts
 | Substantive packet, no active mission | Compiles OBJECTIVE / SCOPE / AUTHORITY / CONSTRAINTS / ACCEPTANCE / ATTENTION, writes durable state, stores the packet verbatim, starts working without asking for plan approval |
 | Explicit "plan only", "read only", or approval hold | Records the packet and plan, then remains idle until an ordinary go-ahead or optional `/studio start` |
 | Small request | Stays ordinary work. No project is manufactured |
+| New assignment while a mission is active | A substantive packet with a different objective parks the current mission as recoverable history and starts the new one; a re-pasted identical packet or a same-objective correction folds into the live mission instead of restarting it |
+| Unrelated conversation or fresh Pi session | Never inherits the ledger's mission. The status line reports `studio: idle` (with the parked or last mission shown as history), and the mission attaches only on an explicit "resume the mission" or a fresh packet |
 | Small mistake / crossed wire | Studio prefers live authoritative truth, records a soft reconciliation, and carries on without creating a new mission or asking Matthew unnecessarily |
 | End of a turn while `WORKING` | Checkpoints, decides the next action, requests the next turn automatically |
 | Genuinely human-only dependency | `NEEDS_HUMAN`: what is needed, why, what is already complete, repo/branch/SHA, next action. Ambiguous `other` / external-service blockers must show a safe reconciliation or reroute attempt first |
 | Ordinary reply to a blocker | Rechecks the real capability instead of trusting the wording, then resumes |
-| Completion | `COMPLETE` is refused without machine evidence, a revision and a verified remote SHA; emits the concise receipt |
+| Completion | `COMPLETE` is refused without machine evidence, a revision and a verified remote SHA; emits the concise receipt. Git is checked in the mission's recorded worktree, and a refused or failed completion holds the loop instead of restarting completed engineering work |
 
 One footer status line and one notification per mission event. Nothing else.
 
@@ -50,6 +52,7 @@ it is ever committed:
     active-job.json           # mission snapshot: the reload path
     events.jsonl              # append-only audit trail
     jobs/<job-id>/packet.md   # the original packet, outside the conversation
+    jobs/<job-id>/state.json  # parked mission record: recoverable history when the active slot moves on
     config.json               # optional overrides
 ```
 

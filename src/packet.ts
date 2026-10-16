@@ -5,6 +5,8 @@
  * Deterministic and pure: no model call, no repository read.
  */
 
+import { createHash } from "node:crypto";
+
 import type { JobContract } from "./schema.js";
 
 const SECTION_ALIASES: Record<keyof Omit<JobContract, "objective">, readonly string[]> = {
@@ -232,6 +234,46 @@ export function detectControlIntent(text: string): "pause" | "resume" | undefine
   if (/\b(resume|continue|carry on|keep going|pick it up|renew)\b/.test(lower) && /\b(mission|job|run|loop|studio|work)\b/.test(lower)) return "resume";
   if (lower === "continue" || lower === "resume" || lower === "keep going" || lower === "/studio start" || lower === "go ahead" || lower === "start now") return "resume";
   return undefined;
+}
+
+export type InstructionKind = "steering" | "duplicate" | "correction" | "new-instruction";
+
+function normalizeObjective(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Classify an incoming message against the session's current mission, so a
+ * new instruction is never silently swallowed by an old mission and a
+ * re-pasted packet never restarts a live one.
+ *   - steering: ordinary message; continue the current mission;
+ *   - duplicate: the mission's own packet re-pasted verbatim; fold in;
+ *   - correction: a substantive packet for the same objective; fold in;
+ *   - new-instruction: a substantive packet for a different objective.
+ */
+export function classifyInstruction(
+  prompt: string,
+  active: { objective: string; packetSha256: string } | undefined,
+): InstructionKind {
+  if (!isSubstantivePacket(prompt)) return "steering";
+  if (!active) return "new-instruction";
+  const digest = createHash("sha256").update(Buffer.from(prompt, "utf8")).digest("hex");
+  if (digest === active.packetSha256) return "duplicate";
+  const objective = normalizeObjective(compilePacket(prompt).objective);
+  if (objective && objective === normalizeObjective(active.objective)) return "correction";
+  return "new-instruction";
+}
+
+/**
+ * Explicit mission-level resume language ("resume the mission", "continue the
+ * studio job") as opposed to incidental continuation words ("continue",
+ * "go ahead"). Reopening a closed mission needs this stronger form; a weak
+ * go-ahead only re-arms a live one.
+ */
+export function explicitMissionResume(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length > 400) return false;
+  return /\b(resume|renew|continue|carry on with|pick up|restart)\b[^.\n]{0,40}\b(mission|job|studio|loop|run)\b/i.test(trimmed);
 }
 
 /**

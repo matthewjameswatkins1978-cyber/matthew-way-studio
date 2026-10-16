@@ -8,6 +8,7 @@
  * mission alive across compaction, restart, and model or child replacement.
  */
 
+import { existsSync } from "node:fs";
 import { Type } from "typebox";
 import type {
   CustomMessageDraft,
@@ -20,14 +21,14 @@ import type {
 } from "../src/pi-shim.js";
 import { customMessage, textResult } from "../src/pi-shim.js";
 import { ledgerLocation, run, type LedgerLocation } from "../src/paths.js";
-import { adoptLegacyJob, appendEvent, readJob, readLegacySnapshot, writeJob, readPacket, type JobReadResult } from "../src/ledger.js";
+import { adoptLegacyJob, appendEvent, readJob, readLegacySnapshot, writeJob, readPacket, saveJobSnapshot, listJobSnapshots, type JobReadResult } from "../src/ledger.js";
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
-import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyMemory, applyReviewWait, applyReviewWaitRecovery, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
+import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyCompletionRefused, applyMemory, applyReviewWait, applyReviewWaitRecovery, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
 import { acknowledgeReview, importReviewComment, listPendingReviews, readPullRequest, readReviewDelivery } from "../src/review.js";
 import { discoverLanternTools, lanternContextResult, readSnapshot } from "../src/lantern.js";
-import { isSubstantivePacket, detectControlIntent, detectLegacyAdoptionIntent, detectReviewRecoveryIntent } from "../src/packet.js";
+import { isSubstantivePacket, classifyInstruction, detectControlIntent, detectLegacyAdoptionIntent, detectReviewRecoveryIntent, explicitMissionResume, looksLikeResumeAttempt } from "../src/packet.js";
 import { renderMissionBrief, renderNeedsHuman, renderReceipt } from "../src/receipt.js";
 import { canTransition, progressSignature, terminalStatus, type BlockerKind, type JobState } from "../src/schema.js";
 import { renderRuleSnapshot } from "../src/rules.js";
@@ -66,14 +67,78 @@ function jobOf(rt: Runtime): JobState | undefined {
   return rt.read.kind === "loaded" ? rt.read.job : undefined;
 }
 
-function statusLine(job: JobState | undefined, config: StudioConfig): string | undefined {
-  if (!job) return undefined;
+/**
+ * Per-session turn identity. Pi exposes no cross-process turn boundary, so the
+ * extension tracks what the current run is and where it came from:
+ *   - runUser: the run started with a user message (not a custom injection);
+ *   - runOwned: the run is work on this session's current mission;
+ *   - humanSinceBlock: a human message arrived after the last block was
+ *     recorded - the only sanctioned NEEDS_HUMAN resume edge.
+ */
+interface SessionState {
+  sessionStartReason?: string;
+  attachedOverride: boolean;
+  runUser: boolean;
+  runOwned: boolean;
+  humanSinceBlock: boolean;
+}
+
+const sessionStates = new Map<string, SessionState>();
+
+function stateFor(ctx: PiContext | PiToolContext): SessionState {
+  const key = `${ctx.cwd}\0${ctx.sessionManager?.getSessionId?.() ?? "legacy"}`;
+  let state = sessionStates.get(key);
+  if (!state) {
+    state = { attachedOverride: false, runUser: true, runOwned: true, humanSinceBlock: false };
+    sessionStates.set(key, state);
+  }
+  return state;
+}
+
+/**
+ * Is the ledger's active mission this session's current work? Worker-scoped
+ * ledgers bind by construction (readJob refuses other workers). Legacy shared
+ * ledgers bind to the thread: a genuinely new conversation (session_start
+ * reason "new") is detached until Matthew explicitly resumes or replaces the
+ * mission. Anything else may be the same thread after a restart.
+ */
+function missionAttached(rt: Runtime, state: SessionState): boolean {
+  if (rt.location.workerId) return true;
+  if (state.attachedOverride) return true;
+  return state.sessionStartReason !== "new";
+}
+
+/**
+ * The mission's recorded repository is the authoritative association for all
+ * Git observation. A missing worktree is a legible failure, never a silent
+ * fallback to whatever directory the session happens to run from.
+ */
+function missionRootFor(rt: Runtime, job: JobState | undefined, cwd: string): { ok: true; root: string; facts: RepoFacts } | { ok: false; reason: string } {
+  const recorded = job?.repo.root?.trim();
+  if (recorded) {
+    if (!existsSync(recorded)) {
+      return { ok: false, reason: `the mission worktree is missing: ${recorded}` };
+    }
+    return { ok: true, root: recorded, facts: repoFacts(recorded) };
+  }
+  const root = rt.location.repoRoot ?? cwd;
+  return { ok: true, root, facts: rt.facts };
+}
+
+/**
+ * The status line must never present old mission state as current activity.
+ * It distinguishes a live mission this session owns, a parked mission that
+ * belongs elsewhere, closed history, and no mission at all.
+ */
+function statusLine(job: JobState | undefined, config: StudioConfig, attached = true): string | undefined {
+  if (!job) return "studio: idle";
+  if (!attached) return `studio: idle · parked ${job.job_id} ${job.status}`;
+  if (terminalStatus(job.status)) return `studio: idle · last ${job.job_id} ${job.status} ${job.repo.current_sha.slice(0, 7)}`;
   if (job.status === "WAITING_REVIEW") {
     const wait = job.review_wait;
     return wait ? `studio: WAITING_REVIEW · PR #${wait.pull_request} @ ${wait.head_sha.slice(0, 7)}` : "studio: WAITING_REVIEW";
   }
   if (job.status === "NEEDS_HUMAN") return `studio: NEEDS_HUMAN — ${job.blocker?.exact_human_need.slice(0, 60) ?? "blocked"}`;
-  if (terminalStatus(job.status)) return `studio: ${job.status} ${job.repo.current_sha.slice(0, 7)}`;
   const milestone = job.progress.milestone ? ` · ${job.progress.milestone.slice(0, 30)}` : "";
   const allowance = config.autoContinue ? ` · turn ${job.continuation.runs}/${config.maxTurns}` : "";
   return `studio: WORKING${milestone}${allowance}`;
@@ -87,9 +152,9 @@ function safeNotify(ctx: PiContext, message: string, type: "info" | "warning" | 
   }
 }
 
-function updateStatus(ctx: PiContext, job: JobState | undefined, config: StudioConfig): void {
+function updateStatus(ctx: PiContext, job: JobState | undefined, config: StudioConfig, attached = true): void {
   try {
-    ctx.ui.setStatus(STATUS_KEY, statusLine(job, config));
+    ctx.ui.setStatus(STATUS_KEY, statusLine(job, config, attached));
   } catch {
     /* status is advisory */
   }
@@ -106,7 +171,7 @@ function withSection(event: PiBeforeAgentStartEvent, body: string): void {
   event.systemPromptOptions.sections = { ...(event.systemPromptOptions.sections ?? {}), [MISSION_SECTION]: body };
 }
 
-function missionSection(job: JobState, config: StudioConfig, pendingReviews: { id: string; decision: string; author: string }[] = []): string {
+function missionSection(job: JobState, config: StudioConfig, pendingReviews: { id: string; decision: string; author: string }[] = [], resumeAttempt = true): string {
   const brief = renderMissionBrief(job);
   if (job.status === "WAITING_REVIEW") {
     const wait = job.review_wait;
@@ -122,6 +187,15 @@ function missionSection(job: JobState, config: StudioConfig, pendingReviews: { i
     ].join("\n");
   }
   if (job.status === "NEEDS_HUMAN") {
+    if (!resumeAttempt) {
+      return [
+        brief,
+        "",
+        `STUDIO: this mission is NEEDS_HUMAN waiting for: ${job.blocker?.exact_human_need ?? "a human-only dependency"}.`,
+        "The current message does not look like an answer to that need, so the blocker stands: treat the message as ordinary work here and do not claim the need is met.",
+        "If it does resolve the need, recheck the live environment with your own tools first, then record the recheck with studio_checkpoint.",
+      ].join("\n");
+    }
     return [
       brief,
       "",
@@ -153,17 +227,24 @@ function missionSection(job: JobState, config: StudioConfig, pendingReviews: { i
     .join("\n");
 }
 
-function seedMission(ctx: PiContext | PiToolContext, packet: string): { job?: JobState; rt: Runtime; started: boolean } {
+function seedMission(
+  ctx: PiContext | PiToolContext,
+  packet: string,
+  opts: { parkReason?: string } = {},
+): { job?: JobState; rt: Runtime; started: boolean } {
   const rt = runtimeFor(ctx);
   const existing = jobOf(rt);
-  if (existing && !terminalStatus(existing.status)) return { job: existing, rt, started: false };
+  if (existing && !terminalStatus(existing.status) && !opts.parkReason) return { job: existing, rt, started: false };
   if (existing) {
-    // A closed mission never blocks the next one: archive, then start fresh.
-    appendEvent(rt.location, "mission-archived", {
+    // The previous mission is parked as recoverable history: its full record
+    // is preserved beside the packet before the active slot moves on.
+    saveJobSnapshot(rt.location, existing);
+    appendEvent(rt.location, terminalStatus(existing.status) ? "mission-archived" : "mission-parked", {
       job_id: existing.job_id,
       status: existing.status,
       sha: existing.repo.current_sha,
       summary: existing.result?.summary ?? "",
+      reason: opts.parkReason ?? "closed by completion",
     });
   }
   const job = startMission({ packet, location: rt.location, facts: rt.facts });
@@ -197,14 +278,21 @@ export function registerStudio(pi: PiApi): void {
       pi.sendUserMessage?.(packet.toLowerCase() === "start" ? "go ahead" : packet);
     },
   });
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     const rt = runtimeFor(ctx);
     const job = jobOf(rt);
-    updateStatus(ctx, job, rt.config);
+    const state = stateFor(ctx);
+    state.sessionStartReason = event.reason;
+    state.attachedOverride = false;
+    const attached = job ? missionAttached(rt, state) : true;
+    updateStatus(ctx, job, rt.config, attached);
     const warn = describeUnreadable(rt.read, rt.location.dir);
     if (warn) safeNotify(ctx, warn, "warning");
-    if (job && job.status === "WORKING") {
+    if (job && job.status === "WORKING" && attached) {
       safeNotify(ctx, `studio: resuming mission ${job.job_id} — next: ${job.progress.next_action.slice(0, 90) || job.objective.slice(0, 60)}`, "info");
+    }
+    if (job && !attached) {
+      safeNotify(ctx, `studio: parked mission ${job.job_id} (${job.status}) is not attached to this session; say "resume the mission" to attach it or paste a new packet.`, "info");
     }
     // Inbox discovery on restart: the owner learns its exact pending delivery
     // IDs without Matthew ferrying them, and without triggering a model turn.
@@ -223,6 +311,17 @@ export function registerStudio(pi: PiApi): void {
     const rt = runtimeFor(ctx);
     const prompt = event.prompt ?? "";
     const job = jobOf(rt);
+    const state = stateFor(ctx);
+    const attached = job ? missionAttached(rt, state) : true;
+    // Older harnesses and tests omit messageType; a custom-message turn is the
+    // only non-user origin.
+    state.runUser = event.messageType !== "custom";
+    state.runOwned = true;
+    if (state.runUser && job) state.humanSinceBlock = true;
+    const kind = classifyInstruction(
+      prompt,
+      job && !terminalStatus(job.status) ? { objective: job.objective, packetSha256: job.packet.sha256 } : undefined,
+    );
 
     if (rt.config.requireProjectTrust && !trusted(ctx)) {
       withSection(event, "STUDIO: project is not trusted; the packet runtime is idle for this folder.");
@@ -283,8 +382,9 @@ export function registerStudio(pi: PiApi): void {
       return undefined;
     }
     // Ordinary language controls the loop; no ritual commands required.
-    if (job) {
-      const intent = detectControlIntent(prompt);
+    // Mission ownership: only this session's current mission folds messages in.
+    if (job && attached) {
+      const intent = state.runUser ? detectControlIntent(prompt) : undefined;
       if (intent === "pause") {
         const paused: JobState = {
           ...job,
@@ -298,12 +398,19 @@ export function registerStudio(pi: PiApi): void {
         return undefined;
       }
       if (intent === "resume") {
-        const reopened = job.status !== "WORKING" && canTransition(job.status, "WORKING");
+        const reopen = job.status !== "WORKING" && canTransition(job.status, "WORKING");
+        // Reopening a closed mission needs explicit mission-level intent; a
+        // bare "continue" or "go ahead" must never resurrect finished work.
+        if (reopen && terminalStatus(job.status) && !explicitMissionResume(prompt)) {
+          updateStatus(ctx, job, rt.config, attached);
+          withSection(event, missionSection(job, rt.config, [], false));
+          return undefined;
+        }
         const resumed: JobState = {
           ...job,
-          status: reopened ? "WORKING" : job.status,
+          status: reopen ? "WORKING" : job.status,
           continuation: { ...job.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: "renewed by Matthew" },
-          blocker: reopened ? undefined : job.blocker,
+          blocker: reopen ? undefined : job.blocker,
           updated_at: new Date().toISOString(),
         };
         writeJob(rt.location, resumed);
@@ -312,47 +419,124 @@ export function registerStudio(pi: PiApi): void {
         withSection(event, missionSection(resumed, rt.config));
         return undefined;
       }
+      if (!terminalStatus(job.status) && kind === "new-instruction" && state.runUser && prompt.trim().length >= rt.config.minPacketChars) {
+        // A new instruction is a mission switch: park the previous mission as
+        // recoverable history instead of silently swallowing the new work.
+        const seeded = seedMission(ctx, prompt, { parkReason: "new instruction from the owning session" });
+        if (seeded.job) {
+          appendEvent(rt.location, "mission-switch", { from: job.job_id, to: seeded.job.job_id });
+          withSection(event, missionSection(seeded.job, rt.config));
+        }
+        return undefined;
+      }
+      if (!terminalStatus(job.status)) {
+        // Duplicate packets, corrections and ordinary steering fold in.
+        // A human turn is external steering, not autonomous spinning: clear the
+        // no-progress and error streaks so a question cannot trigger the stop-loss.
+        if (job.continuation.unchanged_streak !== 0 || job.continuation.error_streak !== 0) {
+          const rearmed: JobState = {
+            ...job,
+            continuation: { ...job.continuation, unchanged_streak: 0, error_streak: 0, reason: "steered by a new message" },
+            updated_at: new Date().toISOString(),
+          };
+          writeJob(rt.location, rearmed);
+          updateStatus(ctx, rearmed, rt.config);
+          withSection(event, missionSection(rearmed, rt.config, [], looksLikeResumeAttempt(prompt) === "attempt"));
+          return undefined;
+        }
+        updateStatus(ctx, job, rt.config, attached);
+        withSection(event, missionSection(job, rt.config, [], looksLikeResumeAttempt(prompt) === "attempt"));
+        return undefined;
+      }
+      // Closed history in this session: a fresh packet replaces it, an
+      // explicit mission resume reopens it, anything else stays ordinary work.
+      const closedWarn = describeUnreadable(rt.read, rt.location.dir);
+      if (closedWarn) safeNotify(ctx, closedWarn, "warning");
+      if (!isSubstantivePacket(prompt) || prompt.trim().length < rt.config.minPacketChars) {
+        updateStatus(ctx, job, rt.config, attached);
+        withSection(event, missionSection(job, rt.config, [], false));
+        return undefined;
+      }
+      const seeded = seedMission(ctx, prompt, { parkReason: "closed mission replaced by a fresh packet" });
+      if (seeded.job) withSection(event, missionSection(seeded.job, rt.config));
+      return undefined;
     }
 
-    if (!job || terminalStatus(job.status)) {
+    if (job && !attached) {
+      // A parked mission belongs to another conversation: report it clearly,
+      // never fold this work into it and never continue it from here.
+      state.runOwned = false;
+      const intent = state.runUser ? detectControlIntent(prompt) : undefined;
+      if (intent === "pause") {
+        const paused: JobState = {
+          ...job,
+          continuation: { ...job.continuation, allowed: false, reason: "paused by Matthew" },
+          updated_at: new Date().toISOString(),
+        };
+        writeJob(rt.location, paused);
+        appendEvent(rt.location, "paused", { job_id: paused.job_id, from_detached_session: true });
+        updateStatus(ctx, paused, rt.config, false);
+        withSection(event, `${renderMissionBrief(paused)}\n\nSTUDIO: parked mission ${paused.job_id} paused by Matthew. It is not this session's current work.`);
+        return undefined;
+      }
+      if (state.runUser && intent === "resume" && explicitMissionResume(prompt)) {
+        // Explicit mission-level resume is the authorised attach.
+        state.attachedOverride = true;
+        const reopened = job.status !== "WORKING" && canTransition(job.status, "WORKING");
+        const resumed: JobState = {
+          ...job,
+          status: reopened ? "WORKING" : job.status,
+          continuation: { ...job.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: "re-authorised by Matthew in this session" },
+          blocker: reopened ? undefined : job.blocker,
+          updated_at: new Date().toISOString(),
+        };
+        writeJob(rt.location, resumed);
+        appendEvent(rt.location, "renewed", { job_id: resumed.job_id, from: job.status, attached_session: true });
+        state.runOwned = true;
+        updateStatus(ctx, resumed, rt.config, true);
+        withSection(event, missionSection(resumed, rt.config, [], looksLikeResumeAttempt(prompt) === "attempt"));
+        return undefined;
+      }
+      if (state.runUser && kind === "new-instruction" && prompt.trim().length >= rt.config.minPacketChars) {
+        const seeded = seedMission(ctx, prompt, { parkReason: "replaced by a new instruction from another session" });
+        if (seeded.job) {
+          state.runOwned = true;
+          withSection(event, missionSection(seeded.job, rt.config));
+        }
+        return undefined;
+      }
+      updateStatus(ctx, job, rt.config, false);
+      withSection(
+        event,
+        [
+          `STUDIO: parked mission ${job.job_id} (${job.status}) is not attached to this session.`,
+          "Do not report it as current work, do not continue it and do not record this run against it. Work on the message directly with ordinary tools.",
+          "A message like \"resume the mission\" attaches and re-authorises it; a substantial new packet starts a new mission and parks the old one.",
+        ].join("\n"),
+      );
+      return undefined;
+    }
+
+    {
       const warn = describeUnreadable(rt.read, rt.location.dir);
       if (warn) safeNotify(ctx, warn, "warning");
       if (!isSubstantivePacket(prompt) || prompt.trim().length < rt.config.minPacketChars) {
         // Inaction must be legible: a long-but-small message gets an explicit
         // idle note so the model never imagines a mission that was not seeded.
-        if (job) {
-          updateStatus(ctx, job, rt.config);
-          withSection(event, missionSection(job, rt.config));
-        } else if (prompt.trim().length >= 150) {
+        state.runOwned = false;
+        if (prompt.trim().length >= 150) {
           withSection(
             event,
             `STUDIO: no mission started for this message (${prompt.trim().length} chars; a tracked mission needs mission headings and at least ${rt.config.minPacketChars} chars). Do the work directly with ordinary tools; nothing is recorded.`,
           );
         }
+        updateStatus(ctx, undefined, rt.config);
         return undefined;
       }
       const seeded = seedMission(ctx, prompt);
       if (seeded.job) withSection(event, missionSection(seeded.job, rt.config));
       return undefined;
     }
-
-    // A human turn is external steering, not autonomous spinning: clear the
-    // no-progress and error streaks so a question cannot trigger the stop-loss.
-    if (job && (job.continuation.unchanged_streak !== 0 || job.continuation.error_streak !== 0)) {
-      const rearmed: JobState = {
-        ...job,
-        continuation: { ...job.continuation, unchanged_streak: 0, error_streak: 0, reason: "steered by a new message" },
-        updated_at: new Date().toISOString(),
-      };
-      writeJob(rt.location, rearmed);
-      updateStatus(ctx, rearmed, rt.config);
-      withSection(event, missionSection(rearmed, rt.config));
-      return undefined;
-    }
-
-    updateStatus(ctx, job, rt.config);
-    withSection(event, missionSection(job, rt.config));
-    return undefined;
   });
 
   pi.on("agent_before_settle", async (event: PiBoundaryEvent, ctx): Promise<PiBoundaryResult | undefined> => {
@@ -360,6 +544,10 @@ export function registerStudio(pi: PiApi): void {
       const rt = runtimeFor(ctx);
       const job = jobOf(rt);
       if (!job || !rt.config.autoContinue) return undefined;
+      // Automatic continuation belongs to the session's current mission only.
+      // An unrelated turn must never consume this mission's run allowance or
+      // trip its stop-loss.
+      if (!stateFor(ctx).runOwned) return undefined;
       if (terminalStatus(job.status) || job.status === "NEEDS_HUMAN" || job.status === "WAITING_REVIEW") {
         updateStatus(ctx, job, rt.config);
         return undefined;
@@ -388,6 +576,9 @@ export function registerStudio(pi: PiApi): void {
           resume_condition: "A reply that redirects or re-authorises the mission.",
         };
         const stalled = applyBlock(job, blocker);
+        // The stop-loss summary turn must not resurrect the mission it just
+        // stopped: the resume edge reopens only after a fresh human message.
+        stateFor(ctx).humanSinceBlock = false;
         writeJob(rt.location, stalled);
         appendEvent(rt.location, "stop-loss", { job_id: job.job_id, reason: decision.reason, signature: progressSignature(job) });
         updateStatus(ctx, stalled, rt.config);
@@ -584,6 +775,7 @@ export function registerStudio(pi: PiApi): void {
       human_confirmed: Type.Optional(
         Type.Array(Type.Integer({ minimum: 1 }), { description: "Confirmations are never recorded: no verified human-turn boundary exists in-process. Supplying this refuses the checkpoint; close human-gated work as PARTIAL." }),
       ),
+      repo_root: Type.Optional(Type.String({ description: "Explicitly re-bind the mission's authoritative repository/worktree when the work lives elsewhere; validated against an existing git worktree and recorded" })),
       reconciliation: Type.Optional(Type.String({ description: "Small corrected assumption/crossed wire; preserves history and continues the same mission" })),
       lantern: Type.Optional(Type.String({ description: "used | not-needed | unavailable" })),
       lantern_refs: Type.Optional(Type.Array(Type.String({ description: "Lantern handles/ids referenced" }))),
@@ -594,6 +786,21 @@ export function registerStudio(pi: PiApi): void {
       const job = jobOf(rt);
       if (!job) {
         return textResult("No active Studio mission. Small jobs do not need one: just do the work. A substantial packet starts a mission automatically.", undefined, true);
+      }
+      // The authoritative repository association may be corrected explicitly
+      // when the work lives in a dedicated worktree: validated first, recorded
+      // in the append-only trail, never inferred from this session's cwd.
+      let active = job;
+      const rebind = str(params["repo_root"]);
+      if (rebind) {
+        const probe = repoFacts(rebind.trim());
+        if (!probe.is_repo) {
+          return textResult(`repo_root ${rebind.trim()} is not an existing git worktree; the mission keeps its recorded association ${job.repo.root || "(none)"}.`, undefined, true);
+        }
+        if (probe.root !== job.repo.root) {
+          active = { ...job, repo: { ...job.repo, root: probe.root }, updated_at: new Date().toISOString() };
+          appendEvent(rt.location, "repo-rebound", { job_id: job.job_id, from: job.repo.root, to: probe.root });
+        }
       }
       const checks = parseChecks(params["checks"]);
       const humanConfirmed = Array.isArray(params["human_confirmed"])
@@ -607,7 +814,7 @@ export function registerStudio(pi: PiApi): void {
         );
       }
 
-      const updated = applyCheckpoint(job, {
+      const updated = applyCheckpoint(active, {
         milestone: str(params["milestone"]),
         next_action: str(params["next_action"]),
         checks,
@@ -622,7 +829,7 @@ export function registerStudio(pi: PiApi): void {
         lantern: lanternStatus(str(params["lantern"])),
         lantern_refs: strArray(params["lantern_refs"]),
         decisions_loaded: strArray(params["decisions_loaded"]),
-      });
+      }, { resumeEdge: stateFor(ctx).humanSinceBlock });
       writeJob(rt.location, updated);
       appendEvent(rt.location, "checkpoint", {
         job_id: updated.job_id,
@@ -752,7 +959,19 @@ export function registerStudio(pi: PiApi): void {
     execute: async (_id, params, _signal, _update, ctx) => {
       const rt = runtimeFor(ctx);
       const job = jobOf(rt);
-      const root = rt.location.repoRoot ?? ctx.cwd;
+      // The mission's recorded repository is authoritative for every Git
+      // operation; a missing worktree is a legible failure, not a silent
+      // fallback to another directory.
+      const bound = missionRootFor(rt, job, ctx.cwd);
+      if (!bound.ok) {
+        return textResult(
+          `studio_ship cannot verify this mission: ${bound.reason}. Refusing to run Git in a different directory; restore the mission worktree or block with studio_blocked (kind access).`,
+          undefined,
+          true,
+        );
+      }
+      const root = bound.root;
+      const mfacts = bound.facts;
       const wantsCommit = params["commit"] === true;
       const message = str(params["message"]);
       const remoteName = str(params["remote"]) || "origin";
@@ -761,26 +980,26 @@ export function registerStudio(pi: PiApi): void {
       if (params["dry_run"] === true) {
         return textResult(
           [
-            `DRY RUN · ${rt.facts.is_repo ? "repo" : "not a repo"}`,
-            `root: ${rt.facts.root || root}`,
-            `remote: ${canonicalRepo(rt.facts.remote) || "(none)"}`,
-            `branch: ${branch || "(detached)"} · head: ${rt.facts.head_sha.slice(0, 10) || "(no commits)"}`,
-            `dirty: ${rt.facts.dirty ? `yes (${rt.facts.dirty_paths.length} path(s))` : "no"}`,
-            `upstream: ${rt.facts.upstream || "(none)"}`,
+            `DRY RUN · ${mfacts.is_repo ? "repo" : "not a repo"}`,
+            `root: ${mfacts.root || root}`,
+            `remote: ${canonicalRepo(mfacts.remote) || "(none)"}`,
+            `branch: ${branch || "(detached)"} · head: ${mfacts.head_sha.slice(0, 10) || "(no commits)"}`,
+            `dirty: ${mfacts.dirty ? `yes (${mfacts.dirty_paths.length} path(s))` : "no"}`,
+            `upstream: ${mfacts.upstream || "(none)"}`,
             `ledger: ${rt.location.dir} (${rt.location.source})`,
           ].join("\n"),
-          { facts: rt.facts },
+          { facts: mfacts },
         );
       }
-      if (!rt.facts.is_repo) return textResult("studio_ship needs a git repository. If one is genuinely missing, that is a human-only dependency: block with kind access.", undefined, true);
+      if (!mfacts.is_repo) return textResult("studio_ship needs a git repository. If one is genuinely missing, that is a human-only dependency: block with kind access.", undefined, true);
       // Destination gates run before ANY write: forbidden branches, and
       // pushing HEAD to a ref other than the checkout, are refused up front.
       if (!branch) return textResult("detached HEAD: check out the mission branch before shipping.", undefined, true);
       if (isProtectedBranch(branch, rt.config.protectedBranches)) {
         return textResult(`refusing to ship protected branch '${branch}': use an isolated feature branch (Lucy merges integration branches).`, undefined, true);
       }
-      if (rt.facts.branch && rt.facts.branch !== branch) {
-        return textResult(`refusing to push HEAD (${rt.facts.branch}) to a different ref '${branch}': check out the target branch first.`, undefined, true);
+      if (mfacts.branch && mfacts.branch !== branch) {
+        return textResult(`refusing to push HEAD (${mfacts.branch}) to a different ref '${branch}': check out the target branch first.`, undefined, true);
       }
       let staged: string[] = [];
       let committed: string[] = [];
@@ -821,7 +1040,7 @@ export function registerStudio(pi: PiApi): void {
           branch,
           commits: push.local_sha ? [push.local_sha] : undefined,
           pushed_shas: push.remote?.verified ? [push.local_sha] : undefined,
-        });
+        }, { resumeEdge: stateFor(ctx).humanSinceBlock });
         writeJob(rt.location, updated);
         appendEvent(rt.location, "ship", { job_id: job.job_id, ok: push.ok, detail: push.detail, branch, sha: push.local_sha });
       }
@@ -868,15 +1087,32 @@ export function registerStudio(pi: PiApi): void {
       const summary = str(params["summary"]) ?? "";
       const branchParam = str(params["branch"]);
       const headParam = str(params["head_sha"]);
-      const branch = branchParam || job.repo.branch || rt.facts.branch;
-      const head = headParam || rt.facts.head_sha || job.repo.current_sha;
-      // Bind to live git identity observed just now: caller-supplied branch
-      // or revision must equal the checkout, never a fabricated value.
-      if (branchParam && rt.facts.branch && branchParam !== rt.facts.branch) {
-        return textResult(`branch '${branchParam}' does not match the live checkout '${rt.facts.branch}': re-observe before completing.`, undefined, true);
+      // The mission's recorded repository is authoritative: completion checks
+      // Git in the mission worktree, never in whatever directory the session
+      // happens to run from.
+      const bound = missionRootFor(rt, job, ctx.cwd);
+      if (!bound.ok) {
+        writeJob(rt.location, applyCompletionRefused(job, [bound.reason]));
+        return textResult(
+          [
+            `studio_complete cannot verify this mission: ${bound.reason}.`,
+            "Refusing to check Git in a different directory. Restore the mission worktree (or block with studio_blocked, kind access) and reconcile before completing.",
+            "Completed engineering work is not restarted: the loop is held until this is reconciled.",
+          ].join("\n"),
+          { job_id: job.job_id, held: true },
+          true,
+        );
       }
-      if (headParam && rt.facts.head_sha && headParam.toLowerCase() !== rt.facts.head_sha.toLowerCase()) {
-        return textResult(`head_sha ${headParam.slice(0, 10)} does not match live HEAD ${rt.facts.head_sha.slice(0, 10)}: re-observe before completing.`, undefined, true);
+      const facts = bound.facts;
+      const branch = branchParam || job.repo.branch || facts.branch;
+      const head = headParam || facts.head_sha || job.repo.current_sha;
+      // Bind to live git identity observed just now: caller-supplied branch
+      // or revision must equal the mission checkout, never a fabricated value.
+      if (branchParam && facts.branch && branchParam !== facts.branch) {
+        return textResult(`branch '${branchParam}' does not match the live checkout '${facts.branch}' in ${bound.root}: re-observe before completing.`, undefined, true);
+      }
+      if (headParam && facts.head_sha && headParam.toLowerCase() !== facts.head_sha.toLowerCase()) {
+        return textResult(`head_sha ${headParam.slice(0, 10)} does not match live HEAD ${facts.head_sha.slice(0, 10)} in ${bound.root}: re-observe before completing.`, undefined, true);
       }
       const lastRecorded = job.evidence.pushed_shas[job.evidence.pushed_shas.length - 1] ?? "";
       const pushed = str(params["pushed_sha"]) || lastRecorded;
@@ -884,7 +1120,7 @@ export function registerStudio(pi: PiApi): void {
       let pushVerified: boolean | undefined;
       let pushDetail = "not attempted";
       if (params["verify_push"] !== false && outcome === "COMPLETE" && branch) {
-        const check = verifyRemoteSha(rt.location.repoRoot ?? ctx.cwd, branch, pushed || head);
+        const check = verifyRemoteSha(bound.root, branch, pushed || head);
         pushVerified = check.verified;
         pushDetail = check.detail;
         if (!check.verified) appendEvent(rt.location, "push-verify-failed", { job_id: job.job_id, detail: check.detail });
@@ -894,7 +1130,7 @@ export function registerStudio(pi: PiApi): void {
         repo: { ...job.repo, current_sha: head || job.repo.current_sha },
         evidence: { ...job.evidence, pushed_shas: pushVerified === true && (pushed || head) ? [...new Set([...job.evidence.pushed_shas, pushed || head])] : job.evidence.pushed_shas },
       };
-      const gate = evaluateCompletion(candidate, { outcome, summary, head_sha: head, branch, pushed_sha: pushed, push_verified: pushVerified, dogfood }, { dirty: rt.facts.dirty });
+      const gate = evaluateCompletion(candidate, { outcome, summary, head_sha: head, branch, pushed_sha: pushed, push_verified: pushVerified, dogfood }, { dirty: facts.dirty });
       if (gate.reaffirm) {
         return textResult(`${job.result?.receipt ?? renderReceipt(candidate, rt.facts, { push_verified: pushVerified })}\n\nAlready recorded as ${job.status}; nothing was re-declared.`, {
           job_id: job.job_id,
@@ -903,9 +1139,21 @@ export function registerStudio(pi: PiApi): void {
         });
       }
       if (!gate.ok) {
+        // A failed completion must not restart completed engineering work:
+        // the loop is held until Matthew re-authorises it or the evidence gap
+        // is fixed within this turn.
+        writeJob(rt.location, applyCompletionRefused(job, gate.problems));
         return textResult(
-          ["COMPLETE refused — fix the evidence, record the honest outcome (PARTIAL/FAILED), or block with studio_blocked.", "", ...gate.problems.map((p) => `- ${p}`), "", `push check: ${pushDetail}`].join("\n"),
-          { problems: gate.problems },
+          [
+            "COMPLETE refused — fix the evidence, record the honest outcome (PARTIAL/FAILED), or block with studio_blocked.",
+            "",
+            ...gate.problems.map((p) => `- ${p}`),
+            "",
+            `push check: ${pushDetail}`,
+            "",
+            "The loop is held: do not redo completed engineering work. Fix only the evidence gap in this turn if you can and call studio_complete again; otherwise wait for Matthew.",
+          ].join("\n"),
+          { problems: gate.problems, held: true },
           true,
         );
       }
@@ -916,7 +1164,7 @@ export function registerStudio(pi: PiApi): void {
         { outcome, summary, head_sha: head, branch, remote: job.repo.remote || rt.facts.remote, pushed_sha: pushed, push_verified: pushVerified, dogfood },
         "",
       );
-      const receipt = renderReceipt(completed, rt.facts, { push_verified: pushVerified });
+      const receipt = renderReceipt(completed, facts, { push_verified: pushVerified });
       const finalJob: JobState = completed.result ? { ...completed, result: { ...completed.result, receipt } } : completed;
       writeJob(rt.location, finalJob, { backup: true });
       appendEvent(rt.location, "complete", { job_id: finalJob.job_id, outcome, sha: finalJob.repo.current_sha, push_verified: pushVerified === true });
@@ -945,10 +1193,12 @@ export function registerStudio(pi: PiApi): void {
         const legacyHint = legacy.kind === "loaded" && rt.location.workerId
           ? `legacy snapshot: ${legacy.job.job_id} (${legacy.job.status}). To adopt it into THIS session, say: adopt legacy job ${legacy.job.job_id}`
           : "legacy snapshot: none";
+        const parkedHistory = listJobSnapshots(rt.location);
         return textResult(
           [
             warn ?? "No active Studio mission.",
             legacyHint,
+            `parked history: ${parkedHistory.length ? parkedHistory.map((p) => `${p.job_id} (${p.status})`).join(", ") : "none"}`,
             `ledger: ${rt.location.dir} (${rt.location.source})`,
             `branch: ${rt.facts.branch || "(none)"} @ ${rt.facts.head_sha.slice(0, 10) || "(no commits)"}`,
             `dirty: ${rt.facts.dirty ? `${rt.facts.dirty_paths.length} path(s)` : "no"}`,
@@ -959,9 +1209,12 @@ export function registerStudio(pi: PiApi): void {
       }
       const passed = job.evidence.checks.filter((c) => c.status === "pass").length;
       const inbox = job.status === "WAITING_REVIEW" && rt.location.workerId ? listPendingReviews(rt.location) : [];
+      const parkedHistory = listJobSnapshots(rt.location).filter((p) => p.job_id !== job.job_id);
       const lines = [
         renderMissionBrief(job),
+        `supervising: ${missionAttached(rt, stateFor(ctx)) ? "this session's current mission" : "NOT this session's mission (parked; do not continue it from here)"}`,
         `ledger: ${rt.location.dir} (${rt.location.source})`,
+        ...(parkedHistory.length ? [`parked history: ${parkedHistory.map((p) => `${p.job_id} (${p.status})`).join(", ")}`] : []),
         `dirty now: ${rt.facts.dirty ? `${rt.facts.dirty_paths.length} path(s)` : "no"}`,
         `upstream: ${rt.facts.upstream || "(none)"}`,
         `acceptance items: ${job.acceptance.length} · checks passed: ${passed} · checks recorded: ${job.evidence.checks.length}`,
