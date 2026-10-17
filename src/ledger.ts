@@ -176,8 +176,7 @@ export function makeSessionToken(): string {
   return `legacy:${process.pid}:${randomUUID().slice(0, 8)}`;
 }
 
-function claimProcessAlive(claim: string): boolean {
-  const pid = Number(claim.split(":")[1]);
+function pidAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   if (pid === process.pid) return true;
   try {
@@ -186,6 +185,10 @@ function claimProcessAlive(claim: string): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+function claimProcessAlive(claim: string): boolean {
+  return pidAlive(Number(claim.split(":")[1]));
 }
 
 /**
@@ -205,6 +208,138 @@ export function claimIsForeign(claim: string | undefined, workerId: string | und
   if (sessionToken && claim === sessionToken) return false;
   if (claimIsAbandoned(claim)) return false;
   return true;
+}
+
+/** The identity a mutation presents when claiming an abandoned mission. */
+export interface ClaimHolder {
+  /** Stable Pi session id when the context exposes one. */
+  workerId?: string;
+  /** Synthesised claim token for sessions without a stable id. */
+  sessionToken: string;
+}
+
+export interface MutateResult {
+  ok: boolean;
+  reason?: string;
+  job?: JobState;
+}
+
+function claimLockPath(loc: LedgerLocation): string {
+  return path.join(loc.dir, `claim-lock${loc.workerKey ? `.${loc.workerKey}` : ""}`);
+}
+
+/**
+ * Exclusive claim lock: one ownership-sensitive read-modify-write at a time
+ * per mission slot, across processes. A crashed holder leaves a lock naming
+ * its pid; a dead or unreadable lock is stolen so crash recovery still works.
+ */
+export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5_000): T {
+  const lock = claimLockPath(loc);
+  ensureDir(path.dirname(lock));
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let fd: number | undefined;
+    try {
+      fd = fs.openSync(lock, "wx");
+      fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`, "utf8");
+      fs.closeSync(fd);
+      fd = undefined;
+    } catch {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          /* the descriptor is already gone */
+        }
+      }
+      // Contention, or a lock created but not yet written. Steal only when
+      // the holder is provably dead or the lock is far too old: a
+      // half-written lock from a live process must never be stolen, or every
+      // racer runs at once and ownership splits.
+      let steal = false;
+      try {
+        const stat = fs.statSync(lock);
+        let holderDead = false;
+        try {
+          const raw = JSON.parse(fs.readFileSync(lock, "utf8")) as { pid?: number };
+          const pid = Number(raw.pid);
+          holderDead = Number.isFinite(pid) && pid > 0 && !pidAlive(pid);
+        } catch {
+          holderDead = false;
+        }
+        steal = holderDead || Date.now() - stat.mtimeMs > 30_000;
+      } catch {
+        continue; // the lock vanished between create and read: retry the acquire
+      }
+      if (steal) {
+        try {
+          fs.rmSync(lock, { force: true });
+        } catch {
+          /* another process won the steal; retry the acquire */
+        }
+        continue;
+      }
+      if (Date.now() >= deadline) throw new Error("claim lock timeout: another session is mutating this mission");
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      continue;
+    }
+    try {
+      return fn();
+    } finally {
+      fs.rmSync(lock, { force: true });
+    }
+  }
+}
+
+/**
+ * The one authoritative ownership-sensitive mutation. Runs under the claim
+ * lock: it re-reads the current record, enforces claim ownership, acquires an
+ * abandoned claim exactly once (competing processes lose), applies the
+ * mutation to THAT authoritative job and writes it. Callers must build their
+ * mutation from the fresh job handed to `fn` — never from an earlier read —
+ * so a recovery can never be undone by a stale write.
+ *
+ * `emergencyStop` is the single documented cross-session write: it only ever
+ * disarms automatic continuation, never takes ownership, and still refuses a
+ * stable foreign worker's mission.
+ */
+export function mutateJob(
+  loc: LedgerLocation,
+  holder: ClaimHolder,
+  fn: (fresh: JobState) => JobState | undefined,
+  opts: { emergencyStop?: boolean; timeoutMs?: number } = {},
+): MutateResult {
+  return withClaimLock(
+    loc,
+    () => {
+      const read = readJob(loc);
+      if (read.kind !== "loaded") {
+        return { ok: false, reason: read.kind === "none" ? "no active Studio mission" : `mission record is ${read.kind}` };
+      }
+      const current = read.job;
+      const claim = current.worker_session_id;
+      const mine = !claim || claim === holder.workerId || claim === holder.sessionToken;
+      const abandoned = claimIsAbandoned(claim);
+      if (opts.emergencyStop) {
+        const stableForeign = typeof claim === "string" && !claim.startsWith("legacy:") && claim !== holder.workerId && claim !== holder.sessionToken;
+        if (stableForeign) return { ok: false, reason: "this mission belongs to another Pi session" };
+      } else if (!mine && !abandoned) {
+        return { ok: false, reason: "this mission belongs to another Pi session" };
+      }
+      let base = current;
+      if (!mine && abandoned && !opts.emergencyStop) {
+        const taken = holder.workerId ?? holder.sessionToken;
+        base = { ...current, worker_session_id: taken, updated_at: new Date().toISOString() };
+        writeJob(loc, base);
+        appendEvent(loc, "claim-taken", { job_id: base.job_id, from: claim ?? "", to: taken });
+      }
+      const next = fn(base);
+      if (!next) return { ok: true, job: base };
+      writeJob(loc, next);
+      return { ok: true, job: next };
+    },
+    opts.timeoutMs,
+  );
 }
 
 export function stateSnapshotPath(loc: LedgerLocation, jobId: string): string {

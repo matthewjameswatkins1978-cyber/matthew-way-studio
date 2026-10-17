@@ -21,7 +21,7 @@ import type {
 } from "../src/pi-shim.js";
 import { customMessage, textResult } from "../src/pi-shim.js";
 import { ledgerLocation, run, type LedgerLocation } from "../src/paths.js";
-import { adoptLegacyJob, appendEvent, claimIsAbandoned, claimIsForeign, readJob, readLegacySnapshot, writeJob, readPacket, saveJobSnapshot, listJobSnapshots, makeSessionToken, type JobReadResult } from "../src/ledger.js";
+import { adoptLegacyJob, appendEvent, claimIsAbandoned, claimIsForeign, readJob, readLegacySnapshot, writeJob, readPacket, saveJobSnapshot, listJobSnapshots, makeSessionToken, mutateJob, withClaimLock, type JobReadResult } from "../src/ledger.js";
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
@@ -58,7 +58,7 @@ function locationFor(cwd: string, workerId?: string): LedgerLocation {
 }
 
 function runtimeFor(ctx: PiContext | PiToolContext): Runtime {
-  const location = locationFor(ctx.cwd, ctx.sessionManager?.getSessionId());
+  const location = locationFor(ctx.cwd, ctx.sessionManager?.getSessionId?.());
   const config = loadConfig(location.dir, ctx.cwd).config;
   return { location, config, facts: repoFacts(location.repoRoot ?? ctx.cwd), read: readJob(location) };
 }
@@ -82,32 +82,65 @@ interface SessionState {
   sessionToken: string;
   /** The exact mission this session instance created or adopted. */
   boundJobId?: string;
+  /** Fail-closed marker: this callback cannot be attributed to a conversation. */
+  ambiguous?: boolean;
   runUser: boolean;
   runOwned: boolean;
   humanSinceBlock: boolean;
 }
 
 const sessionStates = new Map<string, SessionState>();
-/** Conversations that announced themselves as new get their own identity. */
-const isolatedStates = new WeakMap<object, SessionState>();
+/** Degraded-mode conversation states keyed by context object. */
+const knownStates = new WeakMap<object, SessionState>();
+/** Directories where a degraded "new" conversation has announced itself. */
+const isolatedCwds = new Set<string>();
 
 function makeState(): SessionState {
   return { attachedOverride: false, sessionToken: makeSessionToken(), runUser: true, runOwned: true, humanSinceBlock: false };
 }
 
+/**
+ * The identity contract. Real Pi always exposes a stable conversation id
+ * (getSessionId, or the session file for exotic harnesses); ownership keys on
+ * that and is robust across callbacks whatever context object Pi hands us.
+ * Without a stable id Studio cannot tell concurrent conversations apart, so
+ * one cooperative identity is kept per directory for legacy harnesses, and any
+ * callback that cannot be attributed once a new conversation has announced
+ * itself there FAILS CLOSED: refusing an unsafe mutation beats guessing
+ * ownership.
+ */
+function sessionIdentity(ctx: PiContext | PiToolContext): string | undefined {
+  return ctx.sessionManager?.getSessionId?.() ?? ctx.sessionManager?.getSessionFile?.();
+}
+
 function stateFor(ctx: PiContext | PiToolContext): SessionState {
-  const workerId = ctx.sessionManager?.getSessionId?.();
-  if (!workerId) {
-    const isolated = isolatedStates.get(ctx);
-    if (isolated) return isolated;
+  const identity = sessionIdentity(ctx);
+  if (identity) {
+    const key = `${ctx.cwd}\0${identity}`;
+    let state = sessionStates.get(key);
+    if (!state) {
+      state = makeState();
+      sessionStates.set(key, state);
+    }
+    return state;
   }
-  const key = `${ctx.cwd}\0${workerId ?? "legacy"}`;
-  let state = sessionStates.get(key);
-  if (!state) {
-    state = makeState();
-    sessionStates.set(key, state);
+  const known = knownStates.get(ctx);
+  if (known) return known;
+  if (isolatedCwds.has(ctx.cwd)) {
+    // Fail closed: this callback cannot be attributed to any conversation.
+    const anonymous = makeState();
+    anonymous.sessionStartReason = "new";
+    anonymous.ambiguous = true;
+    return anonymous;
   }
-  return state;
+  const ambientKey = `${ctx.cwd}\0legacy`;
+  let ambient = sessionStates.get(ambientKey);
+  if (!ambient) {
+    ambient = makeState();
+    sessionStates.set(ambientKey, ambient);
+  }
+  knownStates.set(ctx, ambient);
+  return ambient;
 }
 
 /**
@@ -117,11 +150,12 @@ function stateFor(ctx: PiContext | PiToolContext): SessionState {
  * (resume/reload/startup) keep the cooperative ambient identity.
  */
 function beginConversationState(ctx: PiContext | PiToolContext, reason: string | undefined): SessionState {
-  const workerId = ctx.sessionManager?.getSessionId?.();
-  if (!workerId && (reason === "new" || reason === "fork")) {
+  const identity = sessionIdentity(ctx);
+  if (!identity && (reason === "new" || reason === "fork")) {
     const fresh = makeState();
     fresh.sessionStartReason = reason;
-    isolatedStates.set(ctx, fresh);
+    knownStates.set(ctx, fresh);
+    isolatedCwds.add(ctx.cwd);
     return fresh;
   }
   const state = stateFor(ctx);
@@ -172,23 +206,48 @@ function missionRootFor(rt: Runtime, job: JobState | undefined, cwd: string): { 
  * worker, may read the mission as history but must never mutate or close it
  * just because a shared legacy ledger makes it readable.
  */
-function detachedMissionRefusal(rt: Runtime, ctx: PiContext | PiToolContext, verb: string, mutates = true): string | undefined {
+/**
+ * Read-only session-policy check: a detached conversation, or a session that
+ * is not the recorded owner, may read the mission as history but never mutate
+ * or close it. This predicate has no side effects at all — claim acquisition
+ * happens only inside the atomic mutation — so read paths can never take
+ * ownership and no write can resurrect a stale record.
+ */
+function detachedMissionRefusal(rt: Runtime, ctx: PiContext | PiToolContext, verb: string): string | undefined {
   const job = jobOf(rt);
   if (!job) return undefined;
   const state = stateFor(ctx);
   const foreignWorker = claimIsForeign(job.worker_session_id, rt.location.workerId, state.sessionToken);
   const detached = !missionAttached(rt, state, job);
   if (!foreignWorker && !detached) {
-    // Exclusive recovery: an abandoned claim becomes mine on the first write,
-    // so a competing recovery attempt is refused while I own the mission.
-    if (mutates && claimIsAbandoned(job.worker_session_id)) {
-      const claimed: JobState = { ...job, worker_session_id: rt.location.workerId ?? state.sessionToken, updated_at: new Date().toISOString() };
-      writeJob(rt.location, claimed);
-      appendEvent(rt.location, "claim-taken", { job_id: job.job_id, from: job.worker_session_id, to: claimed.worker_session_id });
-    }
     return undefined;
   }
   return `studio: refusing to ${verb} mission ${job.job_id} (${job.status}): ${foreignWorker ? "it belongs to another Pi session" : "it is not attached to this session"}. This session may read it as history but never mutate or close it. Say \"resume the mission\" to attach first, or start independent work with a fresh packet.`;
+}
+
+/**
+ * The single ownership-sensitive mutation entry: read-only session policy
+ * first, then the atomic claim-enforcing mutation in the ledger. The callback
+ * receives the authoritative current job, so every write operates on live
+ * state, an abandoned claim is acquired exactly once, and a recovery can never
+ * be undone by a stale write.
+ */
+function runMutation(
+  rt: Runtime,
+  ctx: PiContext | PiToolContext,
+  verb: string,
+  fn: (fresh: JobState) => JobState | undefined,
+  opts: { emergencyStop?: boolean } = {},
+): { ok: boolean; reason?: string; job?: JobState } {
+  const state = stateFor(ctx);
+  if (state.ambiguous) {
+    return { ok: false, reason: `studio: refusing to ${verb}: this session has no stable identity and cannot be attributed to a conversation, so ownership cannot be established.` };
+  }
+  if (!opts.emergencyStop) {
+    const refusal = detachedMissionRefusal(rt, ctx, verb);
+    if (refusal) return { ok: false, reason: refusal };
+  }
+  return mutateJob(rt.location, { workerId: rt.location.workerId, sessionToken: state.sessionToken }, fn, opts);
 }
 
 /**
@@ -309,7 +368,14 @@ function seedMission(
 ): { job?: JobState; rt: Runtime; started: boolean; refused?: string } {
   const rt = runtimeFor(ctx);
   const state = stateFor(ctx);
-  const existing = jobOf(rt);
+  if (state.ambiguous) {
+    return { rt, started: false, refused: "this session has no stable identity and cannot be attributed to a conversation; refusing to create a mission it could not prove ownership of." };
+  }
+  // Park-and-seed is one atomic slot operation across processes: two
+  // concurrent seeds can never both claim the same record.
+  return withClaimLock(rt.location, () => {
+  const current = readJob(rt.location);
+  const existing = current.kind === "loaded" ? current.job : undefined;
   if (existing && !terminalStatus(existing.status) && !opts.parkReason) return { job: existing, rt, started: false };
   if (existing) {
     // Never park or replace another live session's writable mission: the
@@ -356,6 +422,7 @@ function seedMission(
   state.attachedOverride = true;
   state.boundJobId = job.job_id;
   return { job, rt, started: true };
+  });
 }
 
 export function registerStudio(pi: PiApi): void {
@@ -487,8 +554,9 @@ export function registerStudio(pi: PiApi): void {
             safeNotify(ctx, "studio: review wait belongs to another Pi session; refusing to recover it from here.", "warning");
           } else {
             try {
-              const recovered = applyReviewWaitRecovery(job, { mode: recovery, reason: prompt.trim().slice(0, 300) });
-              writeJob(rt.location, recovered);
+              const recoveredRes = runMutation(rt, ctx, "recover", (fresh) => applyReviewWaitRecovery(fresh, { mode: recovery, reason: prompt.trim().slice(0, 300) }));
+              if (!recoveredRes.ok || !recoveredRes.job) throw new Error(recoveredRes.reason ?? "refused");
+              const recovered = recoveredRes.job;
               appendEvent(rt.location, "review-wait-recovery", { job_id: recovered.job_id, mode: recovery, from: "WAITING_REVIEW", human_override: true });
               updateStatus(ctx, recovered, rt.config);
               safeNotify(ctx, `studio: review wait ${recovery === "resume" ? "released by Matthew; resuming as human-directed work (not reviewer approval)" : "parked by Matthew; mission is NEEDS_HUMAN"}.`, recovery === "resume" ? "info" : "warning");
@@ -519,12 +587,16 @@ export function registerStudio(pi: PiApi): void {
     if (job && attached) {
       const intent = state.runUser ? detectControlIntent(prompt) : undefined;
       if (intent === "pause") {
-        const paused: JobState = {
-          ...job,
-          continuation: { ...job.continuation, allowed: false, reason: "paused by Matthew" },
+        const pauseRes = runMutation(rt, ctx, "pause", (fresh) => ({
+          ...fresh,
+          continuation: { ...fresh.continuation, allowed: false, reason: "paused by Matthew" },
           updated_at: new Date().toISOString(),
-        };
-        writeJob(rt.location, paused);
+        }));
+        if (!pauseRes.ok || !pauseRes.job) {
+          withSection(event, `STUDIO: ${pauseRes.reason ?? "refused"}`);
+          return undefined;
+        }
+        const paused = pauseRes.job;
         appendEvent(rt.location, "paused", { job_id: paused.job_id });
         updateStatus(ctx, paused, rt.config);
         withSection(event, `${renderMissionBrief(paused)}\n\nSTUDIO: automatic continuation paused by Matthew. Do more only if he asks.`);
@@ -539,14 +611,18 @@ export function registerStudio(pi: PiApi): void {
           withSection(event, missionSection(job, rt.config, [], false));
           return undefined;
         }
-        const resumed: JobState = {
-          ...job,
-          status: reopen ? "WORKING" : job.status,
-          continuation: { ...job.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: "renewed by Matthew" },
-          blocker: reopen ? undefined : job.blocker,
+        const renewRes = runMutation(rt, ctx, "resume", (fresh) => ({
+          ...fresh,
+          status: reopen ? "WORKING" : fresh.status,
+          continuation: { ...fresh.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: "renewed by Matthew" },
+          blocker: reopen ? undefined : fresh.blocker,
           updated_at: new Date().toISOString(),
-        };
-        writeJob(rt.location, resumed);
+        }));
+        if (!renewRes.ok || !renewRes.job) {
+          withSection(event, `STUDIO: ${renewRes.reason ?? "refused"}`);
+          return undefined;
+        }
+        const resumed = renewRes.job;
         appendEvent(rt.location, "renewed", { job_id: resumed.job_id, from: job.status });
         updateStatus(ctx, resumed, rt.config);
         withSection(event, missionSection(resumed, rt.config));
@@ -567,12 +643,12 @@ export function registerStudio(pi: PiApi): void {
         // A human turn is external steering, not autonomous spinning: clear the
         // no-progress and error streaks so a question cannot trigger the stop-loss.
         if (job.continuation.unchanged_streak !== 0 || job.continuation.error_streak !== 0) {
-          const rearmed: JobState = {
-            ...job,
-            continuation: { ...job.continuation, unchanged_streak: 0, error_streak: 0, reason: "steered by a new message" },
+          const rearmedRes = runMutation(rt, ctx, "rearm", (fresh) => ({
+            ...fresh,
+            continuation: { ...fresh.continuation, unchanged_streak: 0, error_streak: 0, reason: "steered by a new message" },
             updated_at: new Date().toISOString(),
-          };
-          writeJob(rt.location, rearmed);
+          }));
+          const rearmed = rearmedRes.job ?? job;
           updateStatus(ctx, rearmed, rt.config);
           withSection(event, missionSection(rearmed, rt.config, [], looksLikeResumeAttempt(prompt) === "attempt"));
           return undefined;
@@ -618,12 +694,16 @@ export function registerStudio(pi: PiApi): void {
           withSection(event, parkedMissionSection(job));
           return undefined;
         }
-        const paused: JobState = {
-          ...job,
-          continuation: { ...job.continuation, allowed: false, reason: "paused by Matthew" },
+        const stopRes = runMutation(rt, ctx, "stop", (fresh) => ({
+          ...fresh,
+          continuation: { ...fresh.continuation, allowed: false, reason: "paused by Matthew" },
           updated_at: new Date().toISOString(),
-        };
-        writeJob(rt.location, paused);
+        }), { emergencyStop: true });
+        if (!stopRes.ok || !stopRes.job) {
+          withSection(event, `STUDIO: ${stopRes.reason ?? "refused"}`);
+          return undefined;
+        }
+        const paused = stopRes.job;
         appendEvent(rt.location, "paused", { job_id: paused.job_id, from_detached_session: true });
         updateStatus(ctx, paused, rt.config, false);
         withSection(event, `${renderMissionBrief(paused)}\n\nSTUDIO: parked mission ${paused.job_id} paused by Matthew. It is not this session's current work.`);
@@ -640,14 +720,18 @@ export function registerStudio(pi: PiApi): void {
         state.attachedOverride = true;
         state.boundJobId = job.job_id;
         const reopened = job.status !== "WORKING" && canTransition(job.status, "WORKING");
-        const resumed: JobState = {
-          ...job,
-          status: reopened ? "WORKING" : job.status,
-          continuation: { ...job.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: "re-authorised by Matthew in this session" },
-          blocker: reopened ? undefined : job.blocker,
+        const renewRes = runMutation(rt, ctx, "resume", (fresh) => ({
+          ...fresh,
+          status: reopened ? "WORKING" : fresh.status,
+          continuation: { ...fresh.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: "re-authorised by Matthew in this session" },
+          blocker: reopened ? undefined : fresh.blocker,
           updated_at: new Date().toISOString(),
-        };
-        writeJob(rt.location, resumed);
+        }));
+        if (!renewRes.ok || !renewRes.job) {
+          withSection(event, `STUDIO: ${renewRes.reason ?? "refused"}`);
+          return undefined;
+        }
+        const resumed = renewRes.job;
         appendEvent(rt.location, "renewed", { job_id: resumed.job_id, from: job.status, attached_session: true });
         state.runOwned = true;
         updateStatus(ctx, resumed, rt.config, true);
@@ -723,8 +807,8 @@ export function registerStudio(pi: PiApi): void {
       const priorEntries = (event.entries ?? []) as CustomMessageDraft[];
 
       if (decision.action === "settle") {
-        writeJob(rt.location, { ...job, continuation: decision.continuation, updated_at: new Date().toISOString() });
-        updateStatus(ctx, job, rt.config);
+        const settleRes = runMutation(rt, ctx, "continue", (fresh) => ({ ...fresh, continuation: decision.continuation, updated_at: new Date().toISOString() }));
+        updateStatus(ctx, settleRes.job ?? job, rt.config);
         return undefined;
       }
 
@@ -736,19 +820,19 @@ export function registerStudio(pi: PiApi): void {
           exact_human_need: "a steer from Matthew — the current approach is not producing measurable progress",
           resume_condition: "A reply that redirects or re-authorises the mission.",
         };
-        const stalled = applyBlock(job, blocker);
         // The stop-loss summary turn must not resurrect the mission it just
         // stopped: the resume edge reopens only after a fresh human message.
         stateFor(ctx).humanSinceBlock = false;
-        writeJob(rt.location, stalled);
+        const stallRes = runMutation(rt, ctx, "stop-loss", (fresh) => applyBlock(fresh, blocker));
+        const stalled = stallRes.job ?? job;
         appendEvent(rt.location, "stop-loss", { job_id: job.job_id, reason: decision.reason, signature: progressSignature(job) });
         updateStatus(ctx, stalled, rt.config);
         safeNotify(ctx, `studio: stop-loss — ${decision.reason}. Reply with a steer when ready to resume.`, "warning");
         return undefined;
       }
 
-      const continued: JobState = { ...job, continuation: decision.continuation, updated_at: new Date().toISOString() };
-      writeJob(rt.location, continued);
+      const continueRes = runMutation(rt, ctx, "continue", (fresh) => ({ ...fresh, continuation: decision.continuation, updated_at: new Date().toISOString() }));
+      const continued: JobState = continueRes.job ?? job;
       appendEvent(rt.location, "continuation", {
         job_id: job.job_id,
         turn: decision.continuation.runs,
@@ -772,7 +856,7 @@ export function registerStudio(pi: PiApi): void {
     const job = jobOf(rt);
     // Status renders with true ownership: a detached conversation must never
     // redisplay an old mission as its current work.
-    updateStatus(ctx, job, rt.config, job ? !detachedMissionRefusal(rt, ctx, "render", false) : true);
+    updateStatus(ctx, job, rt.config, job ? !detachedMissionRefusal(rt, ctx, "render") : true);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -780,13 +864,15 @@ export function registerStudio(pi: PiApi): void {
     const job = jobOf(rt);
     // Only the owning session annotates its own mission on shutdown; a
     // detached or foreign session leaves the record byte-identical.
-    if (job && !terminalStatus(job.status) && !detachedMissionRefusal(rt, ctx, "close")) {
-      writeJob(rt.location, {
-        ...job,
-        continuation: { ...job.continuation, reason: job.continuation.reason || "session closing" },
+    if (job && !terminalStatus(job.status)) {
+      const closeRes = runMutation(rt, ctx, "close", (fresh) => ({
+        ...fresh,
+        continuation: { ...fresh.continuation, reason: fresh.continuation.reason || "session closing" },
         updated_at: new Date().toISOString(),
-      });
-      appendEvent(rt.location, "session-shutdown", { job_id: job.job_id, status: job.status, head: job.repo.current_sha });
+      }));
+      if (closeRes.ok) {
+        appendEvent(rt.location, "session-shutdown", { job_id: job.job_id, status: job.status, head: job.repo.current_sha });
+      }
     }
     try {
       ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -812,7 +898,7 @@ export function registerStudio(pi: PiApi): void {
       if (!job) return textResult("No active Studio mission to place in review wait.", undefined, true);
       const detachedWait = detachedMissionRefusal(rt, ctx, "place in review wait");
       if (detachedWait) return textResult(detachedWait, { job_id: job.job_id, detached: true }, true);
-      const sessionId = ctx.sessionManager?.getSessionId();
+      const sessionId = ctx.sessionManager?.getSessionId?.();
       if (!sessionId) return textResult("Cannot record WAITING_REVIEW: this Pi context does not expose a stable session ID.", undefined, true);
       const requestedReview = str(params["requested_review"]) ?? "general";
       if (!["general", "approval", "correction"].includes(requestedReview)) return textResult("requested_review must be general, approval, or correction.", undefined, true);
@@ -828,17 +914,27 @@ export function registerStudio(pi: PiApi): void {
         return textResult(`Cannot enter review wait: live PR ${pr.branch}@${pr.head_sha.slice(0, 12)} does not exactly match mission checkout ${rt.facts.branch}@${rt.facts.head_sha.slice(0, 12)}. Checkpoint or reconcile the current head first.`, undefined, true);
       }
       try {
-        const waiting = applyReviewWait(job, {
-          repository,
-          pull_request: pr.number,
-          url: pr.url,
-          branch: pr.branch,
-          head_sha: pr.head_sha,
-          worker_session_id: sessionId,
-          requested_review: requestedReview as "general" | "approval" | "correction",
+        let rewaited = true;
+        const waitRes = runMutation(rt, ctx, "place in review wait", (fresh) => {
+          const waiting = applyReviewWait(fresh, {
+            repository,
+            pull_request: pr.number,
+            url: pr.url,
+            branch: pr.branch,
+            head_sha: pr.head_sha,
+            worker_session_id: sessionId,
+            requested_review: requestedReview as "general" | "approval" | "correction",
+          });
+          // An identical re-wait is a no-op and must stay quiet.
+          if (waiting === fresh) {
+            rewaited = false;
+            return undefined;
+          }
+          return waiting;
         });
-        if (waiting !== job) {
-          writeJob(rt.location, waiting);
+        if (!waitRes.ok) throw new Error(waitRes.reason ?? "refused");
+        const waiting = waitRes.job ?? job;
+        if (rewaited) {
           appendEvent(rt.location, "review-wait", { job_id: waiting.job_id, repository, pull_request: pr.number, branch: pr.branch, head_sha: pr.head_sha, worker_session_id: sessionId });
           safeNotify(ctx, `studio: waiting for review · PR #${pr.number} @ ${pr.head_sha.slice(0, 7)}`, "info");
         }
@@ -962,17 +1058,14 @@ export function registerStudio(pi: PiApi): void {
       // The authoritative repository association may be corrected explicitly
       // when the work lives in a dedicated worktree: validated first, recorded
       // in the append-only trail, never inferred from this session's cwd.
-      let active = job;
       const rebind = str(params["repo_root"]);
+      let rebindRoot: string | undefined;
       if (rebind) {
         const probe = repoFacts(rebind.trim());
         if (!probe.is_repo) {
           return textResult(`repo_root ${rebind.trim()} is not an existing git worktree; the mission keeps its recorded association ${job.repo.root || "(none)"}.`, undefined, true);
         }
-        if (probe.root !== job.repo.root) {
-          active = { ...job, repo: { ...job.repo, root: probe.root }, updated_at: new Date().toISOString() };
-          appendEvent(rt.location, "repo-rebound", { job_id: job.job_id, from: job.repo.root, to: probe.root });
-        }
+        rebindRoot = probe.root;
       }
       const checks = parseChecks(params["checks"]);
       const humanConfirmed = Array.isArray(params["human_confirmed"])
@@ -986,23 +1079,33 @@ export function registerStudio(pi: PiApi): void {
         );
       }
 
-      const updated = applyCheckpoint(active, {
-        milestone: str(params["milestone"]),
-        next_action: str(params["next_action"]),
-        checks,
-        commits: strArray(params["commits"]),
-        pushed_shas: strArray(params["pushed_shas"]),
-        artifacts: strArray(params["artifacts"]),
-        head_sha: str(params["head_sha"]),
-        branch: str(params["branch"]),
-        attempts: num(params["attempts"]),
-        child_work: str(params["child_work"]),
-        reconciliation: str(params["reconciliation"]),
-        lantern: lanternStatus(str(params["lantern"])),
-        lantern_refs: strArray(params["lantern_refs"]),
-        decisions_loaded: strArray(params["decisions_loaded"]),
-      }, { resumeEdge: stateFor(ctx).humanSinceBlock });
-      writeJob(rt.location, updated);
+      const checkpointRes = runMutation(rt, ctx, "checkpoint", (fresh) => {
+        const base =
+          rebindRoot && rebindRoot !== fresh.repo.root
+            ? { ...fresh, repo: { ...fresh.repo, root: rebindRoot }, updated_at: new Date().toISOString() }
+            : fresh;
+        return applyCheckpoint(base, {
+          milestone: str(params["milestone"]),
+          next_action: str(params["next_action"]),
+          checks,
+          commits: strArray(params["commits"]),
+          pushed_shas: strArray(params["pushed_shas"]),
+          artifacts: strArray(params["artifacts"]),
+          head_sha: str(params["head_sha"]),
+          branch: str(params["branch"]),
+          attempts: num(params["attempts"]),
+          child_work: str(params["child_work"]),
+          reconciliation: str(params["reconciliation"]),
+          lantern: lanternStatus(str(params["lantern"])),
+          lantern_refs: strArray(params["lantern_refs"]),
+          decisions_loaded: strArray(params["decisions_loaded"]),
+        }, { resumeEdge: stateFor(ctx).humanSinceBlock });
+      });
+      if (!checkpointRes.ok || !checkpointRes.job) return textResult(checkpointRes.reason ?? "refused", { job_id: job.job_id, detached: true }, true);
+      const updated = checkpointRes.job;
+      if (rebindRoot && updated.repo.root !== job.repo.root) {
+        appendEvent(rt.location, "repo-rebound", { job_id: job.job_id, from: job.repo.root, to: updated.repo.root });
+      }
       appendEvent(rt.location, "checkpoint", {
         job_id: updated.job_id,
         from: job.status,
@@ -1083,8 +1186,9 @@ export function registerStudio(pi: PiApi): void {
           true,
         );
       }
-      const blocked = applyBlock(job, input);
-      writeJob(rt.location, blocked);
+      const blockRes = runMutation(rt, ctx, "block", (fresh) => applyBlock(fresh, input));
+      if (!blockRes.ok || !blockRes.job) return textResult(blockRes.reason ?? "refused", { job_id: job.job_id, detached: true }, true);
+      const blocked = blockRes.job;
       appendEvent(rt.location, "needs-human", {
         job_id: blocked.job_id,
         kind,
@@ -1211,13 +1315,12 @@ export function registerStudio(pi: PiApi): void {
       // model never mistakes it for tracked mission progress.
       const joblessNote = !job ? "STUDIO: no active mission — plain git helper; nothing was recorded to a ledger. " : "";
       if (job) {
-        const updated = applyCheckpoint(job, {
+        runMutation(rt, ctx, "ship", (fresh) => applyCheckpoint(fresh, {
           head_sha: facts.head_sha || push.local_sha,
           branch,
           commits: push.local_sha ? [push.local_sha] : undefined,
           pushed_shas: push.remote?.verified ? [push.local_sha] : undefined,
-        }, { resumeEdge: stateFor(ctx).humanSinceBlock });
-        writeJob(rt.location, updated);
+        }, { resumeEdge: stateFor(ctx).humanSinceBlock }));
         appendEvent(rt.location, "ship", { job_id: job.job_id, ok: push.ok, detail: push.detail, branch, sha: push.local_sha });
       }
       const lines = [
@@ -1270,7 +1373,7 @@ export function registerStudio(pi: PiApi): void {
       // happens to run from.
       const bound = missionRootFor(rt, job, ctx.cwd);
       if (!bound.ok) {
-        writeJob(rt.location, applyCompletionRefused(job, [bound.reason]));
+        runMutation(rt, ctx, "complete", (fresh) => applyCompletionRefused(fresh, [bound.reason]));
         return textResult(
           [
             `studio_complete cannot verify this mission: ${bound.reason}.`,
@@ -1320,7 +1423,7 @@ export function registerStudio(pi: PiApi): void {
         // A failed completion must not restart completed engineering work:
         // the loop is held until Matthew re-authorises it or the evidence gap
         // is fixed within this turn.
-        writeJob(rt.location, applyCompletionRefused(job, gate.problems));
+        runMutation(rt, ctx, "complete", (fresh) => applyCompletionRefused(fresh, gate.problems));
         return textResult(
           [
             "COMPLETE refused — fix the evidence, record the honest outcome (PARTIAL/FAILED), or block with studio_blocked.",
@@ -1335,16 +1438,29 @@ export function registerStudio(pi: PiApi): void {
           true,
         );
       }
-      // Render after the transition: a stored receipt must never describe a
-      // mission it just closed as still WORKING.
-      const completed = applyComplete(
-        candidate,
-        { outcome, summary, head_sha: head, branch, remote: job.repo.remote || rt.facts.remote, pushed_sha: pushed, push_verified: pushVerified, dogfood },
-        "",
-      );
-      const receipt = renderReceipt(completed, facts, { push_verified: pushVerified });
-      const finalJob: JobState = completed.result ? { ...completed, result: { ...completed.result, receipt } } : completed;
-      writeJob(rt.location, finalJob, { backup: true });
+      // Render inside the mutation: a stored receipt must never describe a
+      // mission it just closed as still WORKING, and the close must apply to
+      // the authoritative current record.
+      const completeRes = runMutation(rt, ctx, "complete", (fresh) => {
+        const base: JobState = {
+          ...fresh,
+          repo: { ...fresh.repo, current_sha: head || fresh.repo.current_sha },
+          evidence: {
+            ...fresh.evidence,
+            pushed_shas: pushVerified === true && (pushed || head) ? [...new Set([...fresh.evidence.pushed_shas, pushed || head])] : fresh.evidence.pushed_shas,
+          },
+        };
+        const completed = applyComplete(
+          base,
+          { outcome, summary, head_sha: head, branch, remote: fresh.repo.remote || rt.facts.remote, pushed_sha: pushed, push_verified: pushVerified, dogfood },
+          "",
+        );
+        const receipt = renderReceipt(completed, facts, { push_verified: pushVerified });
+        return completed.result ? { ...completed, result: { ...completed.result, receipt } } : completed;
+      });
+      if (!completeRes.ok || !completeRes.job) return textResult(completeRes.reason ?? "refused", undefined, true);
+      const finalJob: JobState = completeRes.job;
+      const receipt = finalJob.result?.receipt ?? renderReceipt(finalJob, facts, { push_verified: pushVerified });
       appendEvent(rt.location, "complete", { job_id: finalJob.job_id, outcome, sha: finalJob.repo.current_sha, push_verified: pushVerified === true });
       updateStatus(ctx, finalJob, rt.config);
       safeNotify(ctx, `studio: ${outcome} — ${finalJob.job_id}`, outcome === "COMPLETE" ? "info" : "warning");
@@ -1390,7 +1506,7 @@ export function registerStudio(pi: PiApi): void {
       const parkedHistory = listJobSnapshots(rt.location).filter((p) => p.job_id !== job.job_id);
       const lines = [
         renderMissionBrief(job),
-        `supervising: ${!detachedMissionRefusal(rt, ctx, "render", false) ? "this session's current mission" : "NOT this session's mission (parked; do not continue it from here)"}`,
+        `supervising: ${!detachedMissionRefusal(rt, ctx, "render") ? "this session's current mission" : "NOT this session's mission (parked; do not continue it from here)"}`,
         `ledger: ${rt.location.dir} (${rt.location.source})`,
         ...(parkedHistory.length ? [`parked history: ${parkedHistory.map((p) => `${p.job_id} (${p.status})`).join(", ")}`] : []),
         `dirty now: ${rt.facts.dirty ? `${rt.facts.dirty_paths.length} path(s)` : "no"}`,
@@ -1460,8 +1576,7 @@ export function registerStudio(pi: PiApi): void {
       // Retrieval is read-only; only the memory note touches the mission, so a
       // detached session gets the context without mutating another mission.
       if (job && !detachedMissionRefusal(rt, ctx, "record memory for")) {
-        const remembered = applyMemory(job, { lantern: result.available ? "used" : "unavailable" });
-        writeJob(rt.location, remembered);
+        runMutation(rt, ctx, "record memory for", (fresh) => applyMemory(fresh, { lantern: result.available ? "used" : "unavailable" }));
         appendEvent(rt.location, "context-retrieval", {
           job_id: job.job_id,
           source: result.source,
