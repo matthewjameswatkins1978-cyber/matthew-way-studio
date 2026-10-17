@@ -61,7 +61,7 @@ export function adoptLegacyJob(loc: LedgerLocation, expectedJobId: string): Lega
   const legacy = readLegacySnapshot(loc);
   if (legacy.kind !== "loaded") return { ok: false, reason: "no adoptable legacy mission snapshot" };
   if (legacy.job.job_id !== expectedJobId) return { ok: false, reason: "legacy job id does not match the expected mission" };
-  if (legacy.job.worker_session_id && legacy.job.worker_session_id !== loc.workerId) {
+  if (claimIsForeign(legacy.job.worker_session_id, loc.workerId, undefined)) {
     return { ok: false, reason: "legacy mission already belongs to another worker" };
   }
   if (fs.existsSync(activeJobPath(loc))) return { ok: false, reason: "this worker already has an active mission" };
@@ -165,6 +165,328 @@ export function writeJob(loc: LedgerLocation, job: JobState, options: WriteOptio
 export function clearJob(loc: LedgerLocation): void {
   const file = activeJobPath(loc);
   if (fs.existsSync(file)) fs.rmSync(file, { force: true });
+}
+
+/**
+ * Sessions without a stable Pi session id get a synthesised claim that is
+ * unique per process. It is recorded on the missions they create so any other
+ * session can tell a live writable mission from shared history.
+ */
+export function makeSessionToken(): string {
+  return `legacy:${process.pid}:${randomUUID().slice(0, 8)}`;
+}
+
+function pidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function claimProcessAlive(claim: string): boolean {
+  return pidAlive(Number(claim.split(":")[1]));
+}
+
+/**
+ * Ownership of a mission claim. A claim naming this session (stable worker id
+ * or synthesised token) is mine. A legacy claim whose process is gone is
+ * inheritable: nobody can be writing that mission. Anything else is somebody
+ * else's writable mission and must stay read-only here.
+ */
+/** A legacy claim whose process is gone: unowned until someone takes it. */
+export function claimIsAbandoned(claim: string | undefined): boolean {
+  return Boolean(claim) && (claim as string).startsWith("legacy:") && !claimProcessAlive(claim as string);
+}
+
+export function claimIsForeign(claim: string | undefined, workerId: string | undefined, sessionToken: string | undefined): boolean {
+  if (!claim) return false;
+  if (workerId && claim === workerId) return false;
+  if (sessionToken && claim === sessionToken) return false;
+  if (claimIsAbandoned(claim)) return false;
+  return true;
+}
+
+/** The identity a mutation presents when claiming an abandoned mission. */
+export interface ClaimHolder {
+  /** Stable Pi session id when the context exposes one. */
+  workerId?: string;
+  /** Synthesised claim token for sessions without a stable id. */
+  sessionToken: string;
+}
+
+export interface MutateResult {
+  ok: boolean;
+  reason?: string;
+  job?: JobState;
+}
+
+function claimLockPath(loc: LedgerLocation): string {
+  return path.join(loc.dir, `claim-lock${loc.workerKey ? `.${loc.workerKey}` : ""}`);
+}
+
+interface ClaimLockEntry {
+  path: string;
+  uid: string;
+  createdAt: number;
+  known: boolean;
+  dead: boolean;
+}
+
+/** Names this lock creates: the legacy fixed name and `<prefix>.<uid>`. */
+function isClaimLockName(name: string, prefix: string): boolean {
+  if (name === prefix) return true;
+  if (!name.startsWith(`${prefix}.`)) return false;
+  return /^\d+-[0-9a-f]{8}$/.test(name.slice(prefix.length + 1));
+}
+
+function isEnoent(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+/**
+ * Inspection must fail closed: a lock set that could not be inspected is
+ * never evidence that no competing lock exists. Only a genuine ENOENT — a
+ * lock concurrently removed between listing and reading — counts as absence;
+ * every other filesystem error is surfaced immediately instead of being
+ * treated as an empty lock set.
+ */
+export function inspectClaimLocks(dir: string, prefix: string): ClaimLockEntry[] {
+  const out: ClaimLockEntry[] = [];
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch (error) {
+    throw new Error(`claim lock inspection failed at ${dir}: ${(error as NodeJS.ErrnoException).code ?? error}. Failing closed rather than assuming no competing lock exists.`);
+  }
+  for (const name of names) {
+    if (!isClaimLockName(name, prefix)) continue;
+    const file = path.join(dir, name);
+    let createdAt = 0;
+    try {
+      createdAt = fs.statSync(file).mtimeMs;
+    } catch (error) {
+      if (isEnoent(error)) continue; // genuine race: the lock was removed
+      throw new Error(`claim lock inspection failed at ${file}: ${(error as NodeJS.ErrnoException).code ?? error}. Failing closed rather than treating an uninspected lock as absent.`);
+    }
+    let uid = name;
+    let known = false;
+    let dead = false;
+    try {
+      const raw = JSON.parse(fs.readFileSync(file, "utf8")) as { pid?: number; uid?: string };
+      const pid = Number(raw.pid);
+      if (Number.isFinite(pid) && pid > 0) {
+        known = true;
+        dead = !pidAlive(pid);
+      }
+      if (typeof raw.uid === "string" && raw.uid) uid = raw.uid;
+    } catch (error) {
+      if (isEnoent(error)) continue; // genuine race: the lock was removed
+      // Unreadable-but-present owner metadata: keep the entry as an unknown
+      // owner so it blocks contenders instead of vanishing from the view.
+      known = false;
+    }
+    out.push({ path: file, uid, createdAt, known, dead });
+  }
+  return out;
+}
+
+/**
+ * Exclusive claim lock across processes, one ownership-sensitive
+ * read-modify-write at a time per mission slot. Every acquisition creates a
+ * UNIQUENY named lock file (`<prefix>.<pid>-<uid>`), so a lock file can only
+ * ever be deleted by its own owner or garbage-collected once its owner is
+ * provably dead: two competing recoveries can never delete a newly acquired
+ * winner's lock. Contenders elect the oldest live lock (creation time, then
+ * uid as tiebreak) and re-scan once after a settle window before entering, so
+ * concurrent creators resolve to exactly one winner. Unknown-owner locks fail
+ * closed with a clear recovery diagnostic; every retry is deadline-bounded.
+ */
+export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5_000): T {
+  const lockPath = claimLockPath(loc);
+  const dir = path.dirname(lockPath);
+  const prefix = path.basename(lockPath);
+  try {
+    ensureDir(dir);
+  } catch (error) {
+    // A lock whose directory cannot even be created can be neither inspected
+    // nor retried: surface the filesystem error immediately.
+    throw new Error(`claim lock could not be created at ${lockPath}: ${(error as NodeJS.ErrnoException).code ?? error}. Fix the filesystem problem and retry.`);
+  }
+  const uid = `${process.pid}-${randomUUID().slice(0, 8)}`;
+  const mine = path.join(dir, `${prefix}.${uid}`);
+  try {
+    fs.writeFileSync(mine, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString(), uid })}\n`, { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    throw new Error(`claim lock could not be created at ${mine}: ${(error as NodeJS.ErrnoException).code ?? error}. Fix the filesystem problem and retry.`);
+  }
+  // Order contenders by their files' actual timestamps: an integer wall-clock
+  // floor would rank same-millisecond neighbours inconsistently.
+  let createdAt = 0;
+  try {
+    createdAt = fs.statSync(mine).mtimeMs;
+  } catch (error) {
+    throw new Error(`claim lock inspection failed at ${mine}: ${(error as NodeJS.ErrnoException).code ?? error}. Failing closed rather than proceeding unseeded.`);
+  }
+  try {
+    const deadline = Date.now() + timeoutMs;
+    let settled = false;
+    for (;;) {
+      const others = inspectClaimLocks(dir, prefix).filter((entry) => entry.path !== mine);
+      // Garbage-collect only locks whose owners are provably dead. The names
+      // are unique per acquisition, so this delete can never touch a live
+      // winner's lock — that is the whole safety argument.
+      for (const other of others) {
+        if (other.known && other.dead) {
+          try {
+            fs.rmSync(other.path, { force: true });
+          } catch {
+            /* another contender collected it first */
+          }
+        }
+      }
+      const blockers = others.filter((entry) => {
+        if (entry.known && entry.dead) return false;
+        // A lock in the modern `<prefix>.<uid>` form is an election
+        // contender: the oldest wins and the rest yield. A lock of any other
+        // provenance (a legacy fixed name) always blocks while its owner is
+        // live or unprovable — it may already hold the section and it never
+        // yields, so its age must not be used to overtake it.
+        if (path.basename(entry.path) !== prefix) {
+          return entry.createdAt < createdAt || (entry.createdAt === createdAt && entry.uid < uid);
+        }
+        return true;
+      });
+      if (blockers.length === 0) {
+        if (!settled) {
+          // Two creators can each miss the other in a single directory scan;
+          // re-scan after a settle window before entering.
+          settled = true;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+          continue;
+        }
+        return fn();
+      }
+      settled = false;
+      if (Date.now() >= deadline) {
+        const unknown = blockers.find((entry) => !entry.known);
+        throw new Error(
+          unknown
+            ? `claim lock timeout: ${unknown.path} has no readable owner and its holder cannot be proven dead; failing closed rather than stealing. If its holder crashed before writing its identity, remove the stale lock manually: ${unknown.path}`
+            : `claim lock timeout: ${blockers.map((entry) => entry.path).join(", ")} ${blockers.length === 1 ? "is" : "are"} held by a live session; wait for it to finish and retry.`,
+        );
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+  } finally {
+    // Only an owner deletes its own lock, and its name is unique to this
+    // acquisition: this delete can never touch anyone else's lock.
+    try {
+      fs.rmSync(mine, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+/**
+ * The one authoritative ownership-sensitive mutation. Runs under the claim
+ * lock: it re-reads the current record, enforces claim ownership, acquires an
+ * abandoned claim exactly once (competing processes lose), applies the
+ * mutation to THAT authoritative job and writes it. Callers must build their
+ * mutation from the fresh job handed to `fn` — never from an earlier read —
+ * so a recovery can never be undone by a stale write.
+ *
+ * `emergencyStop` is the single documented cross-session write: it only ever
+ * disarms automatic continuation, never takes ownership, and still refuses a
+ * stable foreign worker's mission.
+ */
+export function mutateJob(
+  loc: LedgerLocation,
+  holder: ClaimHolder,
+  fn: (fresh: JobState) => JobState | undefined,
+  opts: { emergencyStop?: boolean; timeoutMs?: number } = {},
+): MutateResult {
+  return withClaimLock(
+    loc,
+    () => {
+      const read = readJob(loc);
+      if (read.kind !== "loaded") {
+        return { ok: false, reason: read.kind === "none" ? "no active Studio mission" : `mission record is ${read.kind}` };
+      }
+      const current = read.job;
+      const claim = current.worker_session_id;
+      const mine = Boolean(claim) && (claim === holder.workerId || claim === holder.sessionToken);
+      const unclaimed = !claim;
+      const abandoned = claimIsAbandoned(claim);
+      if (opts.emergencyStop) {
+        const stableForeign = typeof claim === "string" && !claim.startsWith("legacy:") && claim !== holder.workerId && claim !== holder.sessionToken;
+        if (stableForeign) return { ok: false, reason: "this mission belongs to another Pi session" };
+      } else if (!mine && !abandoned && !unclaimed) {
+        return { ok: false, reason: "this mission belongs to another Pi session" };
+      }
+      // The first mutation atomically establishes exclusive ownership of an
+      // unclaimed or abandoned record: the claim lands in the very same write
+      // as the mutation, so two competing sessions can never both own it. An
+      // emergency stop never takes ownership.
+      const taken = holder.workerId ?? holder.sessionToken;
+      const acquiring = !mine && !opts.emergencyStop && (abandoned || unclaimed);
+      let base = current;
+      if (acquiring) {
+        base = { ...current, worker_session_id: taken, updated_at: new Date().toISOString() };
+      }
+      const next = fn(base);
+      if (!next) return { ok: true, job: base };
+      writeJob(loc, next);
+      if (acquiring) appendEvent(loc, "claim-taken", { job_id: next.job_id, from: claim ?? "", to: taken });
+      return { ok: true, job: next };
+    },
+    opts.timeoutMs,
+  );
+}
+
+export function stateSnapshotPath(loc: LedgerLocation, jobId: string): string {
+  return path.join(packetDir(loc, jobId), "state.json");
+}
+
+/**
+ * Park a full mission record beside its packet before the active slot moves
+ * on. History is preserved verbatim, so a parked or replaced mission stays
+ * recoverable and its evidence and authority state are never rewritten away.
+ */
+export function saveJobSnapshot(loc: LedgerLocation, job: JobState): string {
+  const file = stateSnapshotPath(loc, job.job_id);
+  writeFileAtomic(file, `${JSON.stringify(job, null, 2)}\n`);
+  return file;
+}
+
+export function readJobSnapshot(loc: LedgerLocation, jobId: string): JobReadResult {
+  const file = stateSnapshotPath(loc, jobId);
+  if (!fs.existsSync(file)) return { kind: "none" };
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    const job = normalizeJob(raw);
+    if (loc.workerId && job.worker_session_id && job.worker_session_id !== loc.workerId) return { kind: "none" };
+    return { kind: "loaded", job };
+  } catch (error) {
+    return { kind: "corrupt", reason: String(error) };
+  }
+}
+
+/** Parked missions, newest first, for status reporting and recovery. */
+export function listJobSnapshots(loc: LedgerLocation): JobState[] {
+  const dir = path.join(loc.dir, "jobs", ...(loc.workerKey ? [loc.workerKey] : []));
+  if (!fs.existsSync(dir)) return [];
+  const out: JobState[] = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const read = readJobSnapshot(loc, entry.name);
+    if (read.kind === "loaded") out.push(read.job);
+  }
+  return out.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 }
 
 /** Append one JSONL event. Never throws: telemetry must not break the run. */

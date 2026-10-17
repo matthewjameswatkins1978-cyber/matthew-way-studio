@@ -1,6 +1,6 @@
 {
   "name": "matthew-way-studio",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Autonomous packet runtime for Pi: paste a software packet into the ordinary composer and Pi runs it to pushed, evidence-backed completion without ritual commands.",
   "keywords": [

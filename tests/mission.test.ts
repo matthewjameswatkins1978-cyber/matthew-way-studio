@@ -10,6 +10,7 @@ import {
   applyBlock,
   applyCheckpoint,
   applyComplete,
+  applyCompletionRefused,
   applyMemory,
   applyReviewWait,
   blockerSignature,
@@ -370,4 +371,26 @@ test("a mission written by one runtime is readable by the next", () => {
   if (reload.kind !== "loaded") return;
   assert.deepEqual(reload.job, job);
   assert.equal(reload.job.progress.next_action, "wire the boundary");
+});
+
+test("a blocked mission only reopens on the human resume edge", () => {
+  const loc = location();
+  const job = startMission({ packet: PACKET, location: loc, facts: facts() });
+  const blocked = applyBlock(job, { kind: "judgement", reason: "two designs", exact_human_need: "pick a design", resume_condition: "Matthew picks" });
+  assert.equal(blocked.status, "NEEDS_HUMAN");
+  const auto = applyCheckpoint(blocked, { checks: [{ name: "summary", status: "pass" }] }, { resumeEdge: false });
+  assert.equal(auto.status, "NEEDS_HUMAN", "an automatic turn records evidence without reopening");
+  assert.ok(auto.blocker, "the blocker stays attached to its mission");
+  const human = applyCheckpoint(blocked, { checks: [{ name: "recheck", status: "pass" }] }, { resumeEdge: true });
+  assert.equal(human.status, "WORKING", "a human message after the block re-authorises the resume edge");
+});
+
+test("applyCompletionRefused holds the loop instead of restarting engineering work", () => {
+  const loc = location();
+  const job = startMission({ packet: PACKET, location: loc, facts: facts() });
+  const held = applyCompletionRefused(job, ["push not verified: run studio_ship"]);
+  assert.equal(held.continuation.allowed, false, "the loop is held");
+  assert.match(held.continuation.reason, /studio_complete refused/);
+  assert.match(held.progress.next_action, /do not redo completed engineering work/i);
+  assert.equal(held.status, "WORKING", "a refusal is not a mission outcome");
 });

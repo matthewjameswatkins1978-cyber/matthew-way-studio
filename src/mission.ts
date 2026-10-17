@@ -244,7 +244,7 @@ function appendReconciliation(
  * mission back to WORKING from inside a turn, so `NEEDS_HUMAN -> WORKING` stays
  * a real, tested edge.
  */
-export function applyCheckpoint(job: JobState, input: CheckpointInput): JobState {
+export function applyCheckpoint(job: JobState, input: CheckpointInput, opts: { resumeEdge?: boolean } = {}): JobState {
   const next: JobState = {
     ...job,
     progress: {
@@ -275,6 +275,14 @@ export function applyCheckpoint(job: JobState, input: CheckpointInput): JobState
   };
 
   if (job.status === "NEEDS_HUMAN") {
+    // A stop-loss summary, an automatic turn or a failed completion must not
+    // resurrect a blocked mission: the resume edge only opens when a human
+    // message arrived after the block was recorded (resumeEdge from the
+    // extension's turn tracking). Evidence still records.
+    if (opts.resumeEdge === false) {
+      next.continuation = { ...next.continuation, allowed: false, reason: "NEEDS_HUMAN; awaiting a human reply to the recorded need" };
+      return next;
+    }
     // A checkpoint is the sanctioned resume edge: Pi rechecked the capability
     // and it held. Terminal missions are never reopened by a checkpoint -
     // only a fresh packet or an explicit "resume the mission" reopens those.
@@ -320,6 +328,25 @@ export function applyBlock(job: JobState, input: BlockerInput): JobState {
     progress: { ...job.progress, attempts: job.progress.attempts + 1 },
   };
   return next;
+}
+
+/**
+ * A refused or failed studio_complete must not restart completed engineering
+ * work. The loop is held until Matthew re-authorises it, or the agent fixes a
+ * pure evidence gap inside its current turn.
+ */
+export function applyCompletionRefused(job: JobState, problems: readonly string[]): JobState {
+  const detail = problems.slice(0, 3).join("; ");
+  return {
+    ...job,
+    continuation: { ...job.continuation, allowed: false, reason: `studio_complete refused: ${detail || "evidence gate"}` },
+    progress: {
+      ...job.progress,
+      next_action: `Reconcile the refused completion evidence (${detail || "see studio_complete output"}); do not redo completed engineering work.`,
+      attempts: job.progress.attempts + 1,
+    },
+    updated_at: new Date().toISOString(),
+  };
 }
 
 export interface CompleteInput {
