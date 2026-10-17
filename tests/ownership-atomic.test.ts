@@ -22,7 +22,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerStudio } from "../extensions/index.js";
-import { readJob, readEvents, writeJob, activeJobPath, mutateJob, makeSessionToken, claimIsAbandoned } from "../src/ledger.js";
+import { readJob, readEvents, writeJob, activeJobPath, mutateJob, makeSessionToken, claimIsAbandoned, inspectClaimLocks } from "../src/ledger.js";
 import { startMission } from "../src/mission.js";
 import { ledgerLocation, type LedgerLocation } from "../src/paths.js";
 import { repoFacts } from "../src/git.js";
@@ -453,4 +453,44 @@ fs.appendFileSync(log, "DONE " + token + "\\n");
   assert.ok(log.filter((l) => l.startsWith("ENTER")).every((l) => l.includes("lock-ok")), `the winner's lock is never deleted mid-section: ${log.join(" | ")}`);
   const leftover = fs.readdirSync(loc.dir).filter((n) => n.startsWith("claim-lock"));
   assert.deepEqual(leftover, [], `locks are cleaned up: ${leftover.join(", ")}`);
+});
+
+test("lock inspection fails closed instead of reporting no competing locks", () => {
+  const { base } = tempRepo();
+  // A directory that cannot be listed is an uninspected directory — never
+  // proof that no competing lock exists.
+  const missing = path.join(base, "no-such-ledger");
+  assert.throws(
+    () => inspectClaimLocks(missing, "claim-lock"),
+    /claim lock inspection failed[\s\S]*Failing closed/,
+    "a missing ledger directory must fail closed, not read as an empty lock set",
+  );
+  // A ledger path that is a regular file cannot be listed either.
+  const file = path.join(base, "ledger-is-a-file");
+  fs.writeFileSync(file, "not a directory\n", "utf8");
+  assert.throws(
+    () => inspectClaimLocks(file, "claim-lock"),
+    /claim lock inspection failed[\s\S]*Failing closed/,
+    "an unlistable ledger path must fail closed, not read as an empty lock set",
+  );
+});
+
+test("an unreadable lock owner fails closed as a blocker, never as absence", async () => {
+  const { dir } = tempRepo();
+  const loc = ledgerLocation(dir);
+  const job = startMission({ packet: packetFor("Add the status file to the repository."), location: loc, facts: repoFacts(dir) });
+  writeJob(loc, job);
+  // A lock name that is a directory: its owner metadata can never be read.
+  const unreadable = path.join(loc.dir, "claim-lock.12345678-deadbeef");
+  fs.mkdirSync(unreadable);
+  const started = Date.now();
+  assert.throws(
+    () => mutateJob(loc, { sessionToken: makeSessionToken() }, (fresh) => ({ ...fresh, progress: { ...fresh.progress, milestone: "stolen" } }), { timeoutMs: 250 }),
+    /claim lock timeout[\s\S]*failing closed/,
+    "an uninspectable lock blocks the contender instead of being treated as absent",
+  );
+  assert.ok(Date.now() - started >= 200, "it waits for the deadline rather than proceeding");
+  fs.rmdirSync(unreadable);
+  const after = readJob(loc);
+  assert.equal(after.kind === "loaded" && after.job.progress.milestone, "", "the refused mutation changed nothing");
 });

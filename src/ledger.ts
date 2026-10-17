@@ -243,13 +243,24 @@ function isClaimLockName(name: string, prefix: string): boolean {
   return /^\d+-[0-9a-f]{8}$/.test(name.slice(prefix.length + 1));
 }
 
-function inspectClaimLocks(dir: string, prefix: string): ClaimLockEntry[] {
+function isEnoent(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+/**
+ * Inspection must fail closed: a lock set that could not be inspected is
+ * never evidence that no competing lock exists. Only a genuine ENOENT — a
+ * lock concurrently removed between listing and reading — counts as absence;
+ * every other filesystem error is surfaced immediately instead of being
+ * treated as an empty lock set.
+ */
+export function inspectClaimLocks(dir: string, prefix: string): ClaimLockEntry[] {
   const out: ClaimLockEntry[] = [];
   let names: string[] = [];
   try {
     names = fs.readdirSync(dir);
-  } catch {
-    return out;
+  } catch (error) {
+    throw new Error(`claim lock inspection failed at ${dir}: ${(error as NodeJS.ErrnoException).code ?? error}. Failing closed rather than assuming no competing lock exists.`);
   }
   for (const name of names) {
     if (!isClaimLockName(name, prefix)) continue;
@@ -257,8 +268,9 @@ function inspectClaimLocks(dir: string, prefix: string): ClaimLockEntry[] {
     let createdAt = 0;
     try {
       createdAt = fs.statSync(file).mtimeMs;
-    } catch {
-      continue;
+    } catch (error) {
+      if (isEnoent(error)) continue; // genuine race: the lock was removed
+      throw new Error(`claim lock inspection failed at ${file}: ${(error as NodeJS.ErrnoException).code ?? error}. Failing closed rather than treating an uninspected lock as absent.`);
     }
     let uid = name;
     let known = false;
@@ -271,7 +283,10 @@ function inspectClaimLocks(dir: string, prefix: string): ClaimLockEntry[] {
         dead = !pidAlive(pid);
       }
       if (typeof raw.uid === "string" && raw.uid) uid = raw.uid;
-    } catch {
+    } catch (error) {
+      if (isEnoent(error)) continue; // genuine race: the lock was removed
+      // Unreadable-but-present owner metadata: keep the entry as an unknown
+      // owner so it blocks contenders instead of vanishing from the view.
       known = false;
     }
     out.push({ path: file, uid, createdAt, known, dead });
@@ -310,7 +325,12 @@ export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5
   }
   // Order contenders by their files' actual timestamps: an integer wall-clock
   // floor would rank same-millisecond neighbours inconsistently.
-  const createdAt = fs.statSync(mine).mtimeMs;
+  let createdAt = 0;
+  try {
+    createdAt = fs.statSync(mine).mtimeMs;
+  } catch (error) {
+    throw new Error(`claim lock inspection failed at ${mine}: ${(error as NodeJS.ErrnoException).code ?? error}. Failing closed rather than proceeding unseeded.`);
+  }
   try {
     const deadline = Date.now() + timeoutMs;
     let settled = false;
@@ -328,11 +348,18 @@ export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5
           }
         }
       }
-      const blockers = others.filter(
-        (entry) =>
-          !(entry.known && entry.dead) &&
-          (entry.createdAt < createdAt || (entry.createdAt === createdAt && entry.uid < uid)),
-      );
+      const blockers = others.filter((entry) => {
+        if (entry.known && entry.dead) return false;
+        // A lock in the modern `<prefix>.<uid>` form is an election
+        // contender: the oldest wins and the rest yield. A lock of any other
+        // provenance (a legacy fixed name) always blocks while its owner is
+        // live or unprovable — it may already hold the section and it never
+        // yields, so its age must not be used to overtake it.
+        if (path.basename(entry.path) !== prefix) {
+          return entry.createdAt < createdAt || (entry.createdAt === createdAt && entry.uid < uid);
+        }
+        return true;
+      });
       if (blockers.length === 0) {
         if (!settled) {
           // Two creators can each miss the other in a single directory scan;
