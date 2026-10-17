@@ -288,3 +288,73 @@ test("terminal missions never restart themselves", async () => {
   assert.equal(after.kind === "loaded" && after.job.continuation.allowed, false, "continuation stays disallowed");
   assert.notEqual(rawActive(dir), before, "the evidence note is recorded (record moves forward, status does not)");
 });
+
+test("an old lock belonging to a live process is never stolen", async () => {
+  const { dir } = tempRepo();
+  const loc = ledgerLocation(dir);
+  const job = startMission({ packet: packetFor("Add the status file to the repository."), location: loc, facts: repoFacts(dir) });
+  writeJob(loc, job);
+  const lock = path.join(loc.dir, "claim-lock");
+  fs.writeFileSync(lock, `${JSON.stringify({ pid: process.pid, at: new Date(Date.now() - 120_000).toISOString() })}\n`, "utf8");
+  const old = new Date(Date.now() - 120_000);
+  fs.utimesSync(lock, old, old);
+
+  assert.throws(
+    () => mutateJob(loc, { sessionToken: makeSessionToken() }, (fresh) => ({ ...fresh, progress: { ...fresh.progress, milestone: "stolen" } }), { timeoutMs: 250 }),
+    /claim lock timeout/,
+    "a provably live holder's lock fails safely with a timeout, however old",
+  );
+  assert.ok(fs.existsSync(lock), "the live holder's lock is never stolen on age alone");
+  fs.rmSync(lock, { force: true });
+  const after = readJob(loc);
+  assert.equal(after.kind === "loaded" && after.job.progress.milestone, "", "the refused mutation changed nothing");
+});
+
+test("two distinct sessions competing for an unclaimed record: exactly one becomes its owner", async () => {
+  const { base, dir } = tempRepo();
+  const loc = ledgerLocation(dir);
+  const job = startMission({ packet: packetFor("Add the status file to the repository."), location: loc, facts: repoFacts(dir) });
+  writeJob(loc, job);
+  const initial = readJob(loc);
+  assert.equal(initial.kind === "loaded" && initial.job.worker_session_id, undefined, "the record starts unclaimed");
+
+  const racerSrc = `
+import { mutateJob } from ${JSON.stringify(pathToFileURL(path.join(import.meta.dirname, "..", "src", "ledger.js")).href)};
+const [ledgerDir, startAt, token] = process.argv.slice(2);
+const until = Number(startAt);
+while (Date.now() < until) { /* barrier */ }
+const res = mutateJob({ dir: ledgerDir, source: "git-common-dir" }, { sessionToken: token }, (fresh) => ({
+  ...fresh,
+  progress: { ...fresh.progress, milestone: token },
+}));
+process.stdout.write(JSON.stringify({ ok: res.ok, reason: res.reason ?? "", token, claim: res.job?.worker_session_id ?? "" }));
+`;
+  const racer = path.join(base, "unclaimed-racer.mjs");
+  fs.writeFileSync(racer, racerSrc, "utf8");
+
+  const startAt = Date.now() + 1200;
+  const tokens = ["first-session", "second-session", "third-session"];
+  const results = await Promise.all(
+    tokens.map(
+      (token) =>
+        new Promise<{ ok: boolean; reason: string; token: string; claim: string }>((resolve) => {
+          const child = spawn(process.execPath, [racer, loc.dir, String(startAt), token], { stdio: ["ignore", "pipe", "inherit"] });
+          let out = "";
+          child.stdout.on("data", (d) => (out += d));
+          child.on("exit", () => resolve(JSON.parse(out.trim() || '{"ok":false,"reason":"no output","token":"","claim":""}')));
+        }),
+    ),
+  );
+
+  const winners = results.filter((r) => r.ok);
+  const winner = winners[0];
+  assert.equal(winners.length, 1, `exactly one session may claim an unclaimed record: ${JSON.stringify(results)}`);
+  assert.ok(winner, "a winner exists");
+  assert.equal(results.filter((r) => /another Pi session/.test(r.reason)).length, results.length - 1, "losers get the ownership refusal");
+  const after = readJob(loc);
+  assert.equal(after.kind, "loaded");
+  if (after.kind !== "loaded") return;
+  assert.equal(after.job.worker_session_id, winner.token, "the first mutation established one exclusive owner");
+  assert.equal(after.job.progress.milestone, winner.token, "exactly the winner's mutation landed");
+  assert.ok(readEvents(loc, 100).some((e) => e.type === "claim-taken"), "the acquisition is recorded");
+});

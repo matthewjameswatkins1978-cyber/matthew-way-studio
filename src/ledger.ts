@@ -260,14 +260,23 @@ export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5
       try {
         const stat = fs.statSync(lock);
         let holderDead = false;
+        let holderKnown = false;
         try {
           const raw = JSON.parse(fs.readFileSync(lock, "utf8")) as { pid?: number };
           const pid = Number(raw.pid);
-          holderDead = Number.isFinite(pid) && pid > 0 && !pidAlive(pid);
+          if (Number.isFinite(pid) && pid > 0) {
+            holderKnown = true;
+            holderDead = !pidAlive(pid);
+          }
         } catch {
-          holderDead = false;
+          holderKnown = false;
         }
-        steal = holderDead || Date.now() - stat.mtimeMs > 30_000;
+        // A provably live holder always wins over age: its lock is never
+        // stolen, however old — we fail safely with an explicit timeout. A
+        // lock is stolen only on proof its holder is dead, or when it names no
+        // readable holder at all and is far too old (a holder that died
+        // between create and write).
+        steal = (holderKnown && holderDead) || (!holderKnown && Date.now() - stat.mtimeMs > 30_000);
       } catch {
         continue; // the lock vanished between create and read: retry the acquire
       }
@@ -318,24 +327,29 @@ export function mutateJob(
       }
       const current = read.job;
       const claim = current.worker_session_id;
-      const mine = !claim || claim === holder.workerId || claim === holder.sessionToken;
+      const mine = Boolean(claim) && (claim === holder.workerId || claim === holder.sessionToken);
+      const unclaimed = !claim;
       const abandoned = claimIsAbandoned(claim);
       if (opts.emergencyStop) {
         const stableForeign = typeof claim === "string" && !claim.startsWith("legacy:") && claim !== holder.workerId && claim !== holder.sessionToken;
         if (stableForeign) return { ok: false, reason: "this mission belongs to another Pi session" };
-      } else if (!mine && !abandoned) {
+      } else if (!mine && !abandoned && !unclaimed) {
         return { ok: false, reason: "this mission belongs to another Pi session" };
       }
+      // The first mutation atomically establishes exclusive ownership of an
+      // unclaimed or abandoned record: the claim lands in the very same write
+      // as the mutation, so two competing sessions can never both own it. An
+      // emergency stop never takes ownership.
+      const taken = holder.workerId ?? holder.sessionToken;
+      const acquiring = !mine && !opts.emergencyStop && (abandoned || unclaimed);
       let base = current;
-      if (!mine && abandoned && !opts.emergencyStop) {
-        const taken = holder.workerId ?? holder.sessionToken;
+      if (acquiring) {
         base = { ...current, worker_session_id: taken, updated_at: new Date().toISOString() };
-        writeJob(loc, base);
-        appendEvent(loc, "claim-taken", { job_id: base.job_id, from: claim ?? "", to: taken });
       }
       const next = fn(base);
       if (!next) return { ok: true, job: base };
       writeJob(loc, next);
+      if (acquiring) appendEvent(loc, "claim-taken", { job_id: next.job_id, from: claim ?? "", to: taken });
       return { ok: true, job: next };
     },
     opts.timeoutMs,
