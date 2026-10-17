@@ -21,7 +21,7 @@ import type {
 } from "../src/pi-shim.js";
 import { customMessage, textResult } from "../src/pi-shim.js";
 import { ledgerLocation, run, type LedgerLocation } from "../src/paths.js";
-import { adoptLegacyJob, appendEvent, claimIsForeign, readJob, readLegacySnapshot, writeJob, readPacket, saveJobSnapshot, listJobSnapshots, makeSessionToken, type JobReadResult } from "../src/ledger.js";
+import { adoptLegacyJob, appendEvent, claimIsAbandoned, claimIsForeign, readJob, readLegacySnapshot, writeJob, readPacket, saveJobSnapshot, listJobSnapshots, makeSessionToken, type JobReadResult } from "../src/ledger.js";
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
@@ -88,14 +88,46 @@ interface SessionState {
 }
 
 const sessionStates = new Map<string, SessionState>();
+/** Conversations that announced themselves as new get their own identity. */
+const isolatedStates = new WeakMap<object, SessionState>();
+
+function makeState(): SessionState {
+  return { attachedOverride: false, sessionToken: makeSessionToken(), runUser: true, runOwned: true, humanSinceBlock: false };
+}
 
 function stateFor(ctx: PiContext | PiToolContext): SessionState {
-  const key = `${ctx.cwd}\0${ctx.sessionManager?.getSessionId?.() ?? "legacy"}`;
+  const workerId = ctx.sessionManager?.getSessionId?.();
+  if (!workerId) {
+    const isolated = isolatedStates.get(ctx);
+    if (isolated) return isolated;
+  }
+  const key = `${ctx.cwd}\0${workerId ?? "legacy"}`;
   let state = sessionStates.get(key);
   if (!state) {
-    state = { attachedOverride: false, sessionToken: makeSessionToken(), runUser: true, runOwned: true, humanSinceBlock: false };
+    state = makeState();
     sessionStates.set(key, state);
   }
+  return state;
+}
+
+/**
+ * session_start is the conversation boundary. A genuinely new conversation
+ * without a stable session id gets its own identity and ownership token, so
+ * two conversations in the same directory never share one. Continuations
+ * (resume/reload/startup) keep the cooperative ambient identity.
+ */
+function beginConversationState(ctx: PiContext | PiToolContext, reason: string | undefined): SessionState {
+  const workerId = ctx.sessionManager?.getSessionId?.();
+  if (!workerId && (reason === "new" || reason === "fork")) {
+    const fresh = makeState();
+    fresh.sessionStartReason = reason;
+    isolatedStates.set(ctx, fresh);
+    return fresh;
+  }
+  const state = stateFor(ctx);
+  state.sessionStartReason = reason;
+  state.attachedOverride = false;
+  state.boundJobId = undefined;
   return state;
 }
 
@@ -140,13 +172,22 @@ function missionRootFor(rt: Runtime, job: JobState | undefined, cwd: string): { 
  * worker, may read the mission as history but must never mutate or close it
  * just because a shared legacy ledger makes it readable.
  */
-function detachedMissionRefusal(rt: Runtime, ctx: PiContext | PiToolContext, verb: string): string | undefined {
+function detachedMissionRefusal(rt: Runtime, ctx: PiContext | PiToolContext, verb: string, mutates = true): string | undefined {
   const job = jobOf(rt);
   if (!job) return undefined;
   const state = stateFor(ctx);
   const foreignWorker = claimIsForeign(job.worker_session_id, rt.location.workerId, state.sessionToken);
   const detached = !missionAttached(rt, state, job);
-  if (!foreignWorker && !detached) return undefined;
+  if (!foreignWorker && !detached) {
+    // Exclusive recovery: an abandoned claim becomes mine on the first write,
+    // so a competing recovery attempt is refused while I own the mission.
+    if (mutates && claimIsAbandoned(job.worker_session_id)) {
+      const claimed: JobState = { ...job, worker_session_id: rt.location.workerId ?? state.sessionToken, updated_at: new Date().toISOString() };
+      writeJob(rt.location, claimed);
+      appendEvent(rt.location, "claim-taken", { job_id: job.job_id, from: job.worker_session_id, to: claimed.worker_session_id });
+    }
+    return undefined;
+  }
   return `studio: refusing to ${verb} mission ${job.job_id} (${job.status}): ${foreignWorker ? "it belongs to another Pi session" : "it is not attached to this session"}. This session may read it as history but never mutate or close it. Say \"resume the mission\" to attach first, or start independent work with a fresh packet.`;
 }
 
@@ -333,10 +374,7 @@ export function registerStudio(pi: PiApi): void {
   pi.on("session_start", async (event, ctx) => {
     const rt = runtimeFor(ctx);
     const job = jobOf(rt);
-    const state = stateFor(ctx);
-    state.sessionStartReason = event.reason;
-    state.attachedOverride = false;
-    state.boundJobId = undefined;
+    const state = beginConversationState(ctx, event.reason);
     // Ownership covers both attachment and worker identity: a foreign
     // worker's mission is never rendered as this session's current work.
     const attached = job ? !detachedMissionRefusal(rt, ctx, "render") : true;
@@ -561,6 +599,12 @@ export function registerStudio(pi: PiApi): void {
       // A parked mission belongs to another conversation: report it clearly,
       // never fold this work into it and never continue it from here.
       state.runOwned = false;
+      // Emergency stop: a stable foreign worker's mission is untouchable even
+      // for the stop; legacy-claimed or unowned shared missions can always be
+      // stopped.
+      const stoppableForeign = typeof job.worker_session_id === "string" && !job.worker_session_id.startsWith("legacy:") && job.worker_session_id !== rt.location.workerId && job.worker_session_id !== state.sessionToken;
+      // Attaching is a stronger act than stopping: a live foreign claim is
+      // never attachable; only unowned or abandoned missions can be adopted.
       const foreignMission = claimIsForeign(job.worker_session_id, rt.location.workerId, state.sessionToken);
       const intent = state.runUser ? detectControlIntent(prompt) : undefined;
       if (intent === "pause") {
@@ -568,7 +612,7 @@ export function registerStudio(pi: PiApi): void {
         // disarms automatic continuation — never advances, reopens or rewrites
         // work — and only for shared missions without a foreign owner. A
         // foreign worker's mission stays protected: its own session stops it.
-        if (foreignMission) {
+        if (stoppableForeign) {
           safeNotify(ctx, "studio: this mission belongs to another Pi session; refusing to touch it from here.", "warning");
           updateStatus(ctx, job, rt.config, false);
           withSection(event, parkedMissionSection(job));
@@ -728,7 +772,7 @@ export function registerStudio(pi: PiApi): void {
     const job = jobOf(rt);
     // Status renders with true ownership: a detached conversation must never
     // redisplay an old mission as its current work.
-    updateStatus(ctx, job, rt.config, job ? !detachedMissionRefusal(rt, ctx, "render") : true);
+    updateStatus(ctx, job, rt.config, job ? !detachedMissionRefusal(rt, ctx, "render", false) : true);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -1346,7 +1390,7 @@ export function registerStudio(pi: PiApi): void {
       const parkedHistory = listJobSnapshots(rt.location).filter((p) => p.job_id !== job.job_id);
       const lines = [
         renderMissionBrief(job),
-        `supervising: ${!detachedMissionRefusal(rt, ctx, "render") ? "this session's current mission" : "NOT this session's mission (parked; do not continue it from here)"}`,
+        `supervising: ${!detachedMissionRefusal(rt, ctx, "render", false) ? "this session's current mission" : "NOT this session's mission (parked; do not continue it from here)"}`,
         `ledger: ${rt.location.dir} (${rt.location.source})`,
         ...(parkedHistory.length ? [`parked history: ${parkedHistory.map((p) => `${p.job_id} (${p.status})`).join(", ")}`] : []),
         `dirty now: ${rt.facts.dirty ? `${rt.facts.dirty_paths.length} path(s)` : "no"}`,

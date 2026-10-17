@@ -11,7 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -290,6 +290,74 @@ test("review recovery works for the owning session and is refused for a detached
   assert.ok(stranger.notifications.some((n) => n.includes("refusing to recover")), "the refusal is announced");
   assert.equal(rawActive(second.dir), before, "the wait and its mission are unchanged");
   assert.ok(!readEvents(shared, 100).some((e) => e.type === "review-wait-recovery"), "no recovery was recorded");
+});
+
+// ------------------------------------------ final identity review regressions
+
+test("same-directory conversations without stable ids never share an ownership token", async () => {
+  const { dir } = tempRepo();
+  const a = makeHarness();
+  registerStudio(a.api);
+  const aCtx = ctxFor(dir, a);
+  await emit(a, "before_agent_start", startEvent(packetFor("Add the status file to the repository.")), aCtx);
+  await a.tools.get("studio_checkpoint")!.execute("a1", { checks: [{ name: "a-suite", status: "pass" }] }, undefined, undefined, aCtx);
+  const before = rawActive(dir);
+
+  // A genuinely new conversation in the SAME directory, without session ids.
+  const b = makeHarness();
+  registerStudio(b.api);
+  const bCtx = ctxFor(dir, b);
+  await emit(b, "session_start", { type: "session_start", reason: "new" }, bCtx);
+  const seed = startEvent(packetFor("Build the cache layer for the ingest pipeline."));
+  await emit(b, "before_agent_start", seed, bCtx);
+  assert.equal(rawActive(dir), before, "the new conversation never parks or replaces the live mission");
+  const checkpoint = await b.tools.get("studio_checkpoint")!.execute("b1", { checks: [{ name: "sneaky", status: "pass" }] }, undefined, undefined, bCtx);
+  assert.equal(checkpoint.isError ?? false, true, "the new conversation cannot checkpoint the live mission");
+  assert.match(checkpoint.content[0]?.text ?? "", /belongs to another Pi session/, "the refusal names the owner");
+  const complete = await b.tools.get("studio_complete")!.execute("b2", { outcome: "PARTIAL", summary: "closing your mission" }, undefined, undefined, bCtx);
+  assert.equal(complete.isError ?? false, true, "the new conversation cannot complete the live mission");
+  assert.equal(rawActive(dir), before, "identity, repository facts and completion state are untouched");
+  const status = await b.tools.get("studio_status")!.execute("b3", {}, undefined, undefined, bCtx);
+  assert.match(status.content[0]?.text ?? "", /NOT this session's mission|not attached/, "status does not present the live mission as current work");
+
+  // The original conversation keeps working normally.
+  const more = await a.tools.get("studio_checkpoint")!.execute("a2", { checks: [{ name: "a-final", status: "pass" }] }, undefined, undefined, aCtx);
+  assert.equal(more.isError ?? false, false, "the owning conversation continues undisturbed");
+  const after = readJob(ledgerLocation(dir));
+  assert.equal(after.kind === "loaded" && after.job.evidence.checks.map((c) => c.name).join(","), "a-suite,a-final", "only the owner's evidence lands");
+});
+
+test("recovering an abandoned mission takes exclusive ownership", async () => {
+  const { dir } = tempRepo();
+  const loc = ledgerLocation(dir);
+  const dead = spawnSync(process.execPath, ["-e", ""], { encoding: "utf8" });
+  const abandoned = startMission({ packet: packetFor("Finish the abandoned ingest work."), location: loc, facts: repoFacts(dir) });
+  writeJob(loc, { ...abandoned, worker_session_id: `legacy:${dead.pid ?? 999999}:deadbeef` });
+
+  // Session B recovers the abandoned mission and starts working.
+  const b = makeHarness();
+  registerStudio(b.api);
+  const bCtx = ctxFor(dir, b);
+  await emit(b, "session_start", { type: "session_start", reason: "resume" }, bCtx);
+  assert.ok(b.notifications.some((n) => n.includes("resuming mission")), "an abandoned mission is durably recoverable");
+  await b.tools.get("studio_checkpoint")!.execute("b1", { checks: [{ name: "b-suite", status: "pass" }] }, undefined, undefined, bCtx);
+  assert.ok(readEvents(loc, 100).some((e) => e.type === "claim-taken"), "recovery establishes exclusive ownership");
+  const owned = rawActive(dir);
+
+  // Session C now attempts the same recovery: refused while B owns the mission.
+  const c = makeHarness();
+  registerStudio(c.api);
+  const cCtx = ctxFor(dir, c);
+  await emit(c, "session_start", { type: "session_start", reason: "new" }, cCtx);
+  await emit(c, "before_agent_start", startEvent("resume the mission"), cCtx);
+  assert.ok(c.notifications.some((n) => n.includes("refusing")), "the competing recovery is refused");
+  const steal = await c.tools.get("studio_checkpoint")!.execute("c1", { checks: [{ name: "sneaky", status: "pass" }] }, undefined, undefined, cCtx);
+  assert.equal(steal.isError ?? false, true, "the recovered mission has exactly one writable owner");
+  assert.equal(rawActive(dir), owned, "B's ownership record is unchanged by C's attempts");
+
+  // B keeps working undisturbed.
+  const more = await b.tools.get("studio_checkpoint")!.execute("b2", { checks: [{ name: "b-final", status: "pass" }] }, undefined, undefined, bCtx);
+  assert.equal(more.isError ?? false, false, "the owner keeps working after the competing attempt");
 });
 
 // ------------------------------------------- Lucy review boundary regressions

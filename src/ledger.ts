@@ -194,11 +194,16 @@ function claimProcessAlive(claim: string): boolean {
  * inheritable: nobody can be writing that mission. Anything else is somebody
  * else's writable mission and must stay read-only here.
  */
+/** A legacy claim whose process is gone: unowned until someone takes it. */
+export function claimIsAbandoned(claim: string | undefined): boolean {
+  return Boolean(claim) && (claim as string).startsWith("legacy:") && !claimProcessAlive(claim as string);
+}
+
 export function claimIsForeign(claim: string | undefined, workerId: string | undefined, sessionToken: string | undefined): boolean {
   if (!claim) return false;
   if (workerId && claim === workerId) return false;
   if (sessionToken && claim === sessionToken) return false;
-  if (claim.startsWith("legacy:") && !claimProcessAlive(claim)) return false;
+  if (claimIsAbandoned(claim)) return false;
   return true;
 }
 
