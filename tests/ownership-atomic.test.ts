@@ -358,3 +358,39 @@ process.stdout.write(JSON.stringify({ ok: res.ok, reason: res.reason ?? "", toke
   assert.equal(after.job.progress.milestone, winner.token, "exactly the winner's mutation landed");
   assert.ok(readEvents(loc, 100).some((e) => e.type === "claim-taken"), "the acquisition is recorded");
 });
+
+test("a lock whose owner cannot be read is never stolen, even when old", async () => {
+  const { dir } = tempRepo();
+  const loc = ledgerLocation(dir);
+  const job = startMission({ packet: packetFor("Add the status file to the repository."), location: loc, facts: repoFacts(dir) });
+  writeJob(loc, job);
+  const lock = path.join(loc.dir, "claim-lock");
+  // Created but not yet written: a live process suspended before its pid.
+  fs.writeFileSync(lock, "", "utf8");
+  const old = new Date(Date.now() - 120_000);
+  fs.utimesSync(lock, old, old);
+
+  assert.throws(
+    () => mutateJob(loc, { sessionToken: makeSessionToken() }, (fresh) => ({ ...fresh, progress: { ...fresh.progress, milestone: "stolen" } }), { timeoutMs: 250 }),
+    /claim lock timeout[\s\S]*remove the stale lock manually/,
+    "an unprovable holder fails closed with a clear recovery diagnostic",
+  );
+  assert.ok(fs.existsSync(lock), "the lock is never stolen on age alone");
+  fs.rmSync(lock, { force: true });
+  const after = readJob(loc);
+  assert.equal(after.kind === "loaded" && after.job.progress.milestone, "", "the refused mutation changed nothing");
+});
+
+test("a lock that cannot even be created yields a useful filesystem error, not an endless retry", async () => {
+  const { base } = tempRepo();
+  const blocked = path.join(base, "ledger-is-a-file");
+  fs.writeFileSync(blocked, "not a directory\n", "utf8");
+  const loc: LedgerLocation = { dir: blocked, source: "fallback" };
+  const started = Date.now();
+  assert.throws(
+    () => mutateJob(loc, { sessionToken: makeSessionToken() }, (fresh) => fresh),
+    /claim lock could not be created/,
+    "a broken lock path surfaces as a useful filesystem error",
+  );
+  assert.ok(Date.now() - started < 1_000, "the failure is immediate, never an endless retry");
+});

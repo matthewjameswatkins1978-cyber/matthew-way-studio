@@ -235,7 +235,13 @@ function claimLockPath(loc: LedgerLocation): string {
  */
 export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5_000): T {
   const lock = claimLockPath(loc);
-  ensureDir(path.dirname(lock));
+  try {
+    ensureDir(path.dirname(lock));
+  } catch (error) {
+    // A lock whose directory cannot even be created can be neither inspected
+    // nor retried: surface the filesystem error immediately.
+    throw new Error(`claim lock could not be created at ${lock}: ${(error as NodeJS.ErrnoException).code ?? error}. Fix the filesystem problem and retry.`);
+  }
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     let fd: number | undefined;
@@ -244,7 +250,7 @@ export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5
       fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`, "utf8");
       fs.closeSync(fd);
       fd = undefined;
-    } catch {
+    } catch (error) {
       if (fd !== undefined) {
         try {
           fs.closeSync(fd);
@@ -252,35 +258,29 @@ export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5
           /* the descriptor is already gone */
         }
       }
-      // Contention, or a lock created but not yet written. Steal only when
-      // the holder is provably dead or the lock is far too old: a
-      // half-written lock from a live process must never be stolen, or every
-      // racer runs at once and ownership splits.
-      let steal = false;
-      try {
-        const stat = fs.statSync(lock);
-        let holderDead = false;
-        let holderKnown = false;
-        try {
-          const raw = JSON.parse(fs.readFileSync(lock, "utf8")) as { pid?: number };
-          const pid = Number(raw.pid);
-          if (Number.isFinite(pid) && pid > 0) {
-            holderKnown = true;
-            holderDead = !pidAlive(pid);
-          }
-        } catch {
-          holderKnown = false;
-        }
-        // A provably live holder always wins over age: its lock is never
-        // stolen, however old — we fail safely with an explicit timeout. A
-        // lock is stolen only on proof its holder is dead, or when it names no
-        // readable holder at all and is far too old (a holder that died
-        // between create and write).
-        steal = (holderKnown && holderDead) || (!holderKnown && Date.now() - stat.mtimeMs > 30_000);
-      } catch {
-        continue; // the lock vanished between create and read: retry the acquire
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        // A real filesystem failure (permissions, broken path, disk): surface
+        // it immediately instead of retrying an unexplainable error forever.
+        throw new Error(`claim lock could not be created at ${lock}: ${code ?? error}. Fix the filesystem problem and retry.`);
       }
-      if (steal) {
+      // Contention. Inspect the existing lock and steal ONLY when its holder
+      // is provably dead. A live holder — and a lock whose owner cannot be
+      // read, e.g. a process suspended between create and write — always
+      // fails closed; the retry is bounded by the deadline.
+      let holderDead = false;
+      let holderKnown = false;
+      try {
+        const raw = JSON.parse(fs.readFileSync(lock, "utf8")) as { pid?: number };
+        const pid = Number(raw.pid);
+        if (Number.isFinite(pid) && pid > 0) {
+          holderKnown = true;
+          holderDead = !pidAlive(pid);
+        }
+      } catch {
+        holderKnown = false;
+      }
+      if (holderKnown && holderDead) {
         try {
           fs.rmSync(lock, { force: true });
         } catch {
@@ -288,7 +288,13 @@ export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5
         }
         continue;
       }
-      if (Date.now() >= deadline) throw new Error("claim lock timeout: another session is mutating this mission");
+      if (Date.now() >= deadline) {
+        throw new Error(
+          holderKnown
+            ? `claim lock timeout: ${lock} is held by a live session; wait for it to finish and retry.`
+            : `claim lock timeout: ${lock} has no readable owner and its holder cannot be proven dead; failing closed rather than stealing. If its holder crashed before writing its identity, remove the stale lock manually: ${lock}`,
+        );
+      }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
       continue;
     }
