@@ -228,80 +228,139 @@ function claimLockPath(loc: LedgerLocation): string {
   return path.join(loc.dir, `claim-lock${loc.workerKey ? `.${loc.workerKey}` : ""}`);
 }
 
+interface ClaimLockEntry {
+  path: string;
+  uid: string;
+  createdAt: number;
+  known: boolean;
+  dead: boolean;
+}
+
+/** Names this lock creates: the legacy fixed name and `<prefix>.<uid>`. */
+function isClaimLockName(name: string, prefix: string): boolean {
+  if (name === prefix) return true;
+  if (!name.startsWith(`${prefix}.`)) return false;
+  return /^\d+-[0-9a-f]{8}$/.test(name.slice(prefix.length + 1));
+}
+
+function inspectClaimLocks(dir: string, prefix: string): ClaimLockEntry[] {
+  const out: ClaimLockEntry[] = [];
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return out;
+  }
+  for (const name of names) {
+    if (!isClaimLockName(name, prefix)) continue;
+    const file = path.join(dir, name);
+    let createdAt = 0;
+    try {
+      createdAt = fs.statSync(file).mtimeMs;
+    } catch {
+      continue;
+    }
+    let uid = name;
+    let known = false;
+    let dead = false;
+    try {
+      const raw = JSON.parse(fs.readFileSync(file, "utf8")) as { pid?: number; uid?: string };
+      const pid = Number(raw.pid);
+      if (Number.isFinite(pid) && pid > 0) {
+        known = true;
+        dead = !pidAlive(pid);
+      }
+      if (typeof raw.uid === "string" && raw.uid) uid = raw.uid;
+    } catch {
+      known = false;
+    }
+    out.push({ path: file, uid, createdAt, known, dead });
+  }
+  return out;
+}
+
 /**
- * Exclusive claim lock: one ownership-sensitive read-modify-write at a time
- * per mission slot, across processes. A crashed holder leaves a lock naming
- * its pid; a dead or unreadable lock is stolen so crash recovery still works.
+ * Exclusive claim lock across processes, one ownership-sensitive
+ * read-modify-write at a time per mission slot. Every acquisition creates a
+ * UNIQUENY named lock file (`<prefix>.<pid>-<uid>`), so a lock file can only
+ * ever be deleted by its own owner or garbage-collected once its owner is
+ * provably dead: two competing recoveries can never delete a newly acquired
+ * winner's lock. Contenders elect the oldest live lock (creation time, then
+ * uid as tiebreak) and re-scan once after a settle window before entering, so
+ * concurrent creators resolve to exactly one winner. Unknown-owner locks fail
+ * closed with a clear recovery diagnostic; every retry is deadline-bounded.
  */
 export function withClaimLock<T>(loc: LedgerLocation, fn: () => T, timeoutMs = 5_000): T {
-  const lock = claimLockPath(loc);
+  const lockPath = claimLockPath(loc);
+  const dir = path.dirname(lockPath);
+  const prefix = path.basename(lockPath);
   try {
-    ensureDir(path.dirname(lock));
+    ensureDir(dir);
   } catch (error) {
     // A lock whose directory cannot even be created can be neither inspected
     // nor retried: surface the filesystem error immediately.
-    throw new Error(`claim lock could not be created at ${lock}: ${(error as NodeJS.ErrnoException).code ?? error}. Fix the filesystem problem and retry.`);
+    throw new Error(`claim lock could not be created at ${lockPath}: ${(error as NodeJS.ErrnoException).code ?? error}. Fix the filesystem problem and retry.`);
   }
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    let fd: number | undefined;
-    try {
-      fd = fs.openSync(lock, "wx");
-      fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString() })}\n`, "utf8");
-      fs.closeSync(fd);
-      fd = undefined;
-    } catch (error) {
-      if (fd !== undefined) {
-        try {
-          fs.closeSync(fd);
-        } catch {
-          /* the descriptor is already gone */
+  const uid = `${process.pid}-${randomUUID().slice(0, 8)}`;
+  const mine = path.join(dir, `${prefix}.${uid}`);
+  try {
+    fs.writeFileSync(mine, `${JSON.stringify({ pid: process.pid, at: new Date().toISOString(), uid })}\n`, { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    throw new Error(`claim lock could not be created at ${mine}: ${(error as NodeJS.ErrnoException).code ?? error}. Fix the filesystem problem and retry.`);
+  }
+  // Order contenders by their files' actual timestamps: an integer wall-clock
+  // floor would rank same-millisecond neighbours inconsistently.
+  const createdAt = fs.statSync(mine).mtimeMs;
+  try {
+    const deadline = Date.now() + timeoutMs;
+    let settled = false;
+    for (;;) {
+      const others = inspectClaimLocks(dir, prefix).filter((entry) => entry.path !== mine);
+      // Garbage-collect only locks whose owners are provably dead. The names
+      // are unique per acquisition, so this delete can never touch a live
+      // winner's lock — that is the whole safety argument.
+      for (const other of others) {
+        if (other.known && other.dead) {
+          try {
+            fs.rmSync(other.path, { force: true });
+          } catch {
+            /* another contender collected it first */
+          }
         }
       }
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") {
-        // A real filesystem failure (permissions, broken path, disk): surface
-        // it immediately instead of retrying an unexplainable error forever.
-        throw new Error(`claim lock could not be created at ${lock}: ${code ?? error}. Fix the filesystem problem and retry.`);
-      }
-      // Contention. Inspect the existing lock and steal ONLY when its holder
-      // is provably dead. A live holder — and a lock whose owner cannot be
-      // read, e.g. a process suspended between create and write — always
-      // fails closed; the retry is bounded by the deadline.
-      let holderDead = false;
-      let holderKnown = false;
-      try {
-        const raw = JSON.parse(fs.readFileSync(lock, "utf8")) as { pid?: number };
-        const pid = Number(raw.pid);
-        if (Number.isFinite(pid) && pid > 0) {
-          holderKnown = true;
-          holderDead = !pidAlive(pid);
+      const blockers = others.filter(
+        (entry) =>
+          !(entry.known && entry.dead) &&
+          (entry.createdAt < createdAt || (entry.createdAt === createdAt && entry.uid < uid)),
+      );
+      if (blockers.length === 0) {
+        if (!settled) {
+          // Two creators can each miss the other in a single directory scan;
+          // re-scan after a settle window before entering.
+          settled = true;
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+          continue;
         }
-      } catch {
-        holderKnown = false;
+        return fn();
       }
-      if (holderKnown && holderDead) {
-        try {
-          fs.rmSync(lock, { force: true });
-        } catch {
-          /* another process won the steal; retry the acquire */
-        }
-        continue;
-      }
+      settled = false;
       if (Date.now() >= deadline) {
+        const unknown = blockers.find((entry) => !entry.known);
         throw new Error(
-          holderKnown
-            ? `claim lock timeout: ${lock} is held by a live session; wait for it to finish and retry.`
-            : `claim lock timeout: ${lock} has no readable owner and its holder cannot be proven dead; failing closed rather than stealing. If its holder crashed before writing its identity, remove the stale lock manually: ${lock}`,
+          unknown
+            ? `claim lock timeout: ${unknown.path} has no readable owner and its holder cannot be proven dead; failing closed rather than stealing. If its holder crashed before writing its identity, remove the stale lock manually: ${unknown.path}`
+            : `claim lock timeout: ${blockers.map((entry) => entry.path).join(", ")} ${blockers.length === 1 ? "is" : "are"} held by a live session; wait for it to finish and retry.`,
         );
       }
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-      continue;
     }
+  } finally {
+    // Only an owner deletes its own lock, and its name is unique to this
+    // acquisition: this delete can never touch anyone else's lock.
     try {
-      return fn();
-    } finally {
-      fs.rmSync(lock, { force: true });
+      fs.rmSync(mine, { force: true });
+    } catch {
+      /* best effort */
     }
   }
 }

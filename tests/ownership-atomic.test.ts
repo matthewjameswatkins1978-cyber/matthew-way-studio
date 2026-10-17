@@ -394,3 +394,63 @@ test("a lock that cannot even be created yields a useful filesystem error, not a
   );
   assert.ok(Date.now() - started < 1_000, "the failure is immediate, never an endless retry");
 });
+
+test("two processes recovering one stale lock never delete the winner's lock and never overlap", async () => {
+  const { base, dir } = tempRepo();
+  const loc = ledgerLocation(dir);
+  const job = startMission({ packet: packetFor("Add the status file to the repository."), location: loc, facts: repoFacts(dir) });
+  writeJob(loc, job);
+
+  // Competing recovery: one stale lock whose owner is provably dead.
+  const staleUid = `dead-${deadPid()}`;
+  fs.writeFileSync(path.join(loc.dir, "claim-lock"), `${JSON.stringify({ pid: deadPid(), at: new Date().toISOString(), uid: staleUid })}\n`, "utf8");
+
+  const logFile = path.join(base, "critical-sections.log");
+  const racerSrc = `
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { withClaimLock } from ${JSON.stringify(pathToFileURL(path.join(import.meta.dirname, "..", "src", "ledger.js")).href)};
+const [ledgerDir, startAt, token, log] = process.argv.slice(2);
+const until = Number(startAt);
+while (Date.now() < until) { /* barrier */ }
+withClaimLock({ dir: ledgerDir, source: "git-common-dir" }, () => {
+  const owners = fs.readdirSync(ledgerDir)
+    .filter((n) => n.startsWith("claim-lock"))
+    .map((n) => { try { return JSON.parse(fs.readFileSync(path.join(ledgerDir, n), "utf8")); } catch { return null; } });
+  const intact = owners.some((o) => o && o.pid === process.pid);
+  fs.appendFileSync(log, "ENTER " + token + " " + (intact ? "lock-ok" : "LOCK-MISSING") + "\\n");
+  const end = Date.now() + 150;
+  while (Date.now() < end) { /* hold the section */ }
+  fs.appendFileSync(log, "EXIT " + token + "\\n");
+}, 8_000);
+fs.appendFileSync(log, "DONE " + token + "\\n");
+`;
+  const racer = path.join(base, "competing-racer.mjs");
+  fs.writeFileSync(racer, racerSrc, "utf8");
+
+  const startAt = Date.now() + 1200;
+  await Promise.all(
+    ["racer-one", "racer-two"].map(
+      (token) =>
+        new Promise<void>((resolve) => {
+          const child = spawn(process.execPath, [racer, loc.dir, String(startAt), token, logFile], { stdio: ["ignore", "inherit", "inherit"] });
+          child.on("exit", () => resolve());
+        }),
+    ),
+  );
+
+  const log = fs.readFileSync(logFile, "utf8").split("\n").filter(Boolean);
+  assert.equal(log.filter((l) => l.startsWith("ENTER")).length, 2, `both processes eventually ran: ${log.join(" | ")}`);
+  assert.equal(log.filter((l) => l.startsWith("EXIT")).length, 2, "both processes left the section cleanly");
+  let depth = 0;
+  for (const line of log) {
+    const verb = line.split(" ")[0];
+    if (verb === "ENTER") depth += 1;
+    if (verb === "EXIT") depth -= 1;
+    assert.ok(depth <= 1, `critical sections must never overlap: ${log.join(" | ")}`);
+  }
+  assert.equal(depth, 0, "every entry is matched by an exit");
+  assert.ok(log.filter((l) => l.startsWith("ENTER")).every((l) => l.includes("lock-ok")), `the winner's lock is never deleted mid-section: ${log.join(" | ")}`);
+  const leftover = fs.readdirSync(loc.dir).filter((n) => n.startsWith("claim-lock"));
+  assert.deepEqual(leftover, [], `locks are cleaned up: ${leftover.join(", ")}`);
+});
