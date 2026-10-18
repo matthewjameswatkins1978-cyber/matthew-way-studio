@@ -131,6 +131,8 @@ export interface JobContinuation {
   unchanged_streak: number;
   /** Consecutive provider/agent errors. */
   error_streak: number;
+  /** Bounded stop-loss recoveries consumed; reset only by a human resume edge. */
+  recoveries: number;
   last_signature: string;
   reason: string;
 }
@@ -352,6 +354,7 @@ export function normalizeJob(raw: unknown): JobState {
       runs: clampInt(cont.runs, 0, 0),
       unchanged_streak: clampInt(cont.unchanged_streak, 0, 0),
       error_streak: clampInt(cont.error_streak, 0, 0),
+      recoveries: clampInt(cont.recoveries, 0, 0),
       last_signature: str(cont.last_signature),
       reason: str(cont.reason),
     },
@@ -418,6 +421,7 @@ export function newJob(input: {
       runs: 0,
       unchanged_streak: 0,
       error_streak: 0,
+      recoveries: 0,
       last_signature: "",
       reason: "mission seeded",
     },

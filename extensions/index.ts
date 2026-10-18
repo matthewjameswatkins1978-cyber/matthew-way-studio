@@ -344,7 +344,7 @@ function missionSection(job: JobState, config: StudioConfig, pendingReviews: { i
     renderRuleSnapshot(job.rules),
     rolePreferenceSection(),
     !job.continuation.allowed ? "STUDIO HOLD: execution is paused by the packet or Matthew. Explain the plan once and wait for an explicit go-ahead; do not poll or request automatic continuation." : "",
-    `- [runtime.bounds] Automatic continuation is bounded: ${config.maxTurns} turns per mission and ${config.maxUnchangedTurns} turns without measurable progress before the stop-loss.`,
+    `- [runtime.bounds] Automatic continuation is bounded: ${config.maxTurns} turns per mission and ${config.maxUnchangedTurns} turns without measurable progress before a bounded stop-loss recovery (${config.maxRecoveries} per mission), then a human steer.`,
     "- [runtime.reconcile] If a small misunderstanding, stale assumption, typo, or crossed wire is corrected, record it with studio_checkpoint.reconciliation and continue. Do not restart the mission.",
     job.blocker ? `- [runtime.blocker] A blocker was recorded earlier (${job.blocker.exact_human_need}); if you worked around it, clear it with studio_checkpoint.` : "",
   ]
@@ -614,7 +614,7 @@ export function registerStudio(pi: PiApi): void {
         const renewRes = runMutation(rt, ctx, "resume", (fresh) => ({
           ...fresh,
           status: reopen ? "WORKING" : fresh.status,
-          continuation: { ...fresh.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: "renewed by Matthew" },
+          continuation: { ...fresh.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, recoveries: 0, reason: "renewed by Matthew" },
           blocker: reopen ? undefined : fresh.blocker,
           updated_at: new Date().toISOString(),
         }));
@@ -802,7 +802,7 @@ export function registerStudio(pi: PiApi): void {
       const decision = decideContinuation(
         job,
         { turnCompleted: outcome === "completed", errored: outcome === "error", aborted: outcome === "aborted" },
-        { maxTurns: rt.config.maxTurns, maxUnchangedTurns: rt.config.maxUnchangedTurns, maxErrorStreak: rt.config.maxErrorStreak },
+        { maxTurns: rt.config.maxTurns, maxUnchangedTurns: rt.config.maxUnchangedTurns, maxErrorStreak: rt.config.maxErrorStreak, maxRecoveries: rt.config.maxRecoveries },
       );
       const priorEntries = (event.entries ?? []) as CustomMessageDraft[];
 
@@ -829,6 +829,26 @@ export function registerStudio(pi: PiApi): void {
         updateStatus(ctx, stalled, rt.config);
         safeNotify(ctx, `studio: stop-loss — ${decision.reason}. Reply with a steer when ready to resume.`, "warning");
         return undefined;
+      }
+
+      if (decision.action === "recover") {
+        // Bounded stop-loss recovery: persist the fresh allowance and hand
+        // the worker the diagnostic slice. Wiring only — the recovery playbook
+        // is policy generated in src/continuation.ts, never decided here.
+        const recoverRes = runMutation(rt, ctx, "stop-loss-recovery", (fresh) => ({ ...fresh, continuation: decision.continuation, updated_at: new Date().toISOString() }));
+        const recovered: JobState = recoverRes.job ?? job;
+        appendEvent(rt.location, "stop-loss-recovery", {
+          job_id: job.job_id,
+          turn: decision.continuation.runs,
+          recovery: decision.continuation.recoveries,
+          next: recovered.progress.next_action.slice(0, 120),
+        });
+        updateStatus(ctx, recovered, rt.config);
+        safeNotify(ctx, `studio: stop-loss recovery ${decision.continuation.recoveries} — diagnosing the stall, then resuming a smaller slice.`, "warning");
+        return {
+          entries: [...priorEntries, customMessage("studio-continuation", decision.instruction, false, { job_id: job.job_id, turn: decision.continuation.runs })],
+          continue: true,
+        };
       }
 
       const continueRes = runMutation(rt, ctx, "continue", (fresh) => ({ ...fresh, continuation: decision.continuation, updated_at: new Date().toISOString() }));

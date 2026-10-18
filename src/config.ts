@@ -72,10 +72,14 @@ export function loadConfig(ledgerDir: string, cwd: string): { config: StudioConf
 export function mergeConfig(base: StudioConfig, raw: Partial<StudioConfig>): StudioConfig {
   const positiveInt = (value: unknown, fallback: number): number =>
     typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : fallback;
+  // Recovery budget only: 0 disables automatic recovery (strict stop-loss).
+  const nonNegativeInt = (value: unknown, fallback: number): number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : fallback;
   return {
     maxTurns: positiveInt(raw.maxTurns, base.maxTurns),
     maxUnchangedTurns: positiveInt(raw.maxUnchangedTurns, base.maxUnchangedTurns),
     maxErrorStreak: positiveInt(raw.maxErrorStreak, base.maxErrorStreak),
+    maxRecoveries: nonNegativeInt(raw.maxRecoveries, base.maxRecoveries),
     minPacketChars: positiveInt(raw.minPacketChars, base.minPacketChars),
     autoContinue: typeof raw.autoContinue === "boolean" ? raw.autoContinue : base.autoContinue,
     requireProjectTrust: typeof raw.requireProjectTrust === "boolean" ? raw.requireProjectTrust : base.requireProjectTrust,

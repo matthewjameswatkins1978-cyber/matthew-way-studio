@@ -578,11 +578,18 @@ test("stop-loss converts a stalled loop into a resumable human need", async () =
   const location = ledgerLocation(dir);
   await emit(harness, "before_agent_start", { type: "before_agent_start", prompt: PACKET, systemPrompt: "", systemPromptOptions: {} } as PiBeforeAgentStartEvent, ctx);
 
-  // Three settled turns that change nothing measurable.
+  // Quiet settled turns: bounded recoveries fire first, then the exhausted
+  // loop converts into a resumable human need.
   let last: PiBoundaryResult | undefined;
-  for (let i = 0; i < 4; i++) last = (await emit(harness, "agent_before_settle", boundaryEvent(), ctx)) as PiBoundaryResult | undefined;
+  for (let i = 0; i < 15; i++) {
+    last = (await emit(harness, "agent_before_settle", boundaryEvent(), ctx)) as PiBoundaryResult | undefined;
+    const read = readJob(location);
+    if (read.kind === "loaded" && read.job.status === "NEEDS_HUMAN") break;
+  }
 
   assert.equal(last, undefined, "a stalled mission settles without another model turn");
+  const recoveryEvents = readEvents(location, 200).filter((e) => e.type === "stop-loss-recovery");
+  assert.equal(recoveryEvents.length, 2, "exactly the budgeted recoveries precede the stall");
   const read = readJob(location);
   assert.equal(read.kind === "loaded" && read.job.status, "NEEDS_HUMAN");
   if (read.kind !== "loaded") return;

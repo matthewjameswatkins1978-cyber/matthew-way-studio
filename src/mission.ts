@@ -114,7 +114,7 @@ export function startMission(input: {
     evidence: { checks: [], commits: [], pushed_shas: [], artifacts: [], human_confirmed: [] },
     memory: { lantern: "not-needed", lantern_refs: [], decisions_loaded: [] },
     human_dogfood: { status: "none", checks: [] },
-    continuation: { allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, last_signature: "", reason: "mission seeded" },
+    continuation: { allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, recoveries: 0, last_signature: "", reason: "mission seeded" },
     rules: currentRuleSnapshot(),
     packet: packetMeta,
     created_at: input.now ?? new Date().toISOString(),
@@ -181,7 +181,7 @@ export function applyReviewWaitRecovery(
   const resumed = applyTransition(job, "WORKING");
   return {
     ...resumed,
-    continuation: { ...job.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: "human review-wait recovery; not reviewer approval" },
+    continuation: { ...job.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, recoveries: 0, reason: "human review-wait recovery; not reviewer approval" },
     progress: { ...job.progress, next_action: input.reason.trim().slice(0, 300) },
     updated_at: now,
   };
@@ -288,7 +288,7 @@ export function applyCheckpoint(job: JobState, input: CheckpointInput, opts: { r
     // only a fresh packet or an explicit "resume the mission" reopens those.
     const transitioned = applyTransition(job, "WORKING");
     next.status = transitioned.status;
-    next.continuation = { ...next.continuation, runs: 0, unchanged_streak: 0, error_streak: 0, allowed: true, reason: "resumed by checkpoint" };
+    next.continuation = { ...next.continuation, runs: 0, unchanged_streak: 0, error_streak: 0, recoveries: 0, allowed: true, reason: "resumed by checkpoint" };
     next.blocker = undefined;
     next.human_dogfood = job.human_dogfood.status === "pending" ? { status: "done", checks: job.human_dogfood.checks } : job.human_dogfood;
     // Human confirmations are NEVER recorded: no observable human-turn

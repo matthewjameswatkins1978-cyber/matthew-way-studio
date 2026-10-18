@@ -115,6 +115,7 @@ mission persists a self-verifying snapshot digest.
   "maxTurns": 60,
   "maxUnchangedTurns": 3,
   "maxErrorStreak": 3,
+  "maxRecoveries": 2,
   "minPacketChars": 320,
   "autoContinue": true,
   "requireProjectTrust": true,
@@ -124,8 +125,10 @@ mission persists a self-verifying snapshot digest.
 
 Put overrides in `<git-common-dir>/matthew-way-studio/config.json`.
 
-- The same material failure never repeats blindly: three quiet turns or three
-  errors trip a stop-loss that converts the stall into a resumable `NEEDS_HUMAN`.
+- The same material failure never repeats blindly: three quiet turns trigger a
+  bounded stop-loss recovery (diagnose, shrink the slice, resume; two per
+  mission by default, `0` disables), and only an exhausted budget — or errors,
+  or an exhausted run allowance — converts the stall into a resumable `NEEDS_HUMAN`.
 - A new message from Matthew is external steering, not spinning, so it clears
   the no-progress and error streaks without resetting the run allowance.
 - "stop the mission" and "resume the mission" are ordinary sentences.

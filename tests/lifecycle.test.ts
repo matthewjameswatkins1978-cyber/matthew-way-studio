@@ -338,7 +338,7 @@ test("stop-loss fires once and an automatic turn cannot resurrect the blocked mi
   const { dir } = tempRepo();
   const location = ledgerLocation(dir);
   fs.mkdirSync(location.dir, { recursive: true });
-  fs.writeFileSync(path.join(location.dir, "config.json"), JSON.stringify({ maxUnchangedTurns: 1, maxErrorStreak: 5, maxTurns: 10 }), "utf8");
+  fs.writeFileSync(path.join(location.dir, "config.json"), JSON.stringify({ maxUnchangedTurns: 1, maxErrorStreak: 5, maxTurns: 10, maxRecoveries: 0 }), "utf8");
 
   const harness = makeHarness();
   registerStudio(harness.api);
@@ -363,6 +363,35 @@ test("stop-loss fires once and an automatic turn cannot resurrect the blocked mi
   await emit(harness, "before_agent_start", startEvent("restart"), ctx);
   await harness.tools.get("studio_checkpoint")!.execute("c2", { next_action: "carry on" }, undefined, undefined, ctx);
   assert.equal(loadedJob(dir).status, "WORKING", "a human message re-authorises the resume edge");
+});
+
+test("stop-loss recovery resumes a smaller slice within budget, then the stall holds", async () => {
+  const { dir } = tempRepo();
+  const location = ledgerLocation(dir);
+  fs.mkdirSync(location.dir, { recursive: true });
+  fs.writeFileSync(path.join(location.dir, "config.json"), JSON.stringify({ maxUnchangedTurns: 1, maxErrorStreak: 5, maxTurns: 10, maxRecoveries: 1 }), "utf8");
+
+  const harness = makeHarness();
+  registerStudio(harness.api);
+  const ctx = ctxFor(dir, harness);
+  await seed(harness, ctx, packetFor("Add the status file to the repository."));
+
+  const first = await emit(harness, "agent_before_settle", settleEvent(), ctx);
+  assert.ok(first && first.continue, "a progressing turn continues");
+  const recovered = await emit(harness, "agent_before_settle", settleEvent(), ctx);
+  assert.ok(recovered && recovered.continue, "the recovery resumes instead of blocking");
+  const entries = JSON.stringify(recovered?.entries ?? []);
+  assert.match(entries, /STOP-LOSS RECOVERY/, "the worker gets the diagnostic slice, not the stall");
+  assert.ok(harness.notifications.some((n) => n.includes("stop-loss recovery")), "the recovery is announced");
+  const mid = loadedJob(dir);
+  assert.equal(mid.status, "WORKING", "recovery keeps the mission working");
+  assert.equal(mid.continuation.recoveries, 1);
+  const recoveryEvents = readEvents(location, 200).filter((e) => e.type === "stop-loss-recovery");
+  assert.equal(recoveryEvents.length, 1);
+
+  const stalled = await emit(harness, "agent_before_settle", settleEvent(), ctx);
+  assert.equal(stalled, undefined, "an exhausted budget stalls quietly");
+  assert.equal(loadedJob(dir).status, "NEEDS_HUMAN", "the repeated stall stops safely");
 });
 
 test("restart resumes the same session's mission and nothing else", async () => {
