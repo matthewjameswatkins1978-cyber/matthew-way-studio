@@ -1,6 +1,10 @@
-# Matthew Way Studio — Autonomous Packet Runtime
+# Matthew Way Studio
 
-Pi behaves as Matthew's ordinary autonomous software workshop.
+**Give Pi the whole job. Let it organise the work, keep its place, and bring back evidence.**
+
+Matthew Way Studio is a Pi extension for durable coding missions. Paste a complete software packet into the normal conversation; Studio turns it into a scoped mission with checkpoints, bounded autonomy and proof-based completion, without requiring a separate command ritual.
+
+It's built for a personal workshop, **not** a generic unattended deployment platform. Human authority and consequential actions remain explicit.
 
 ```text
 folder + repo + packet  ->  Pi  ->  finished pushed work
@@ -12,8 +16,11 @@ Pi owns procedure. There is no orchestration vocabulary to learn: no `/goal`,
 
 ## Install
 
+Clone this repository, then install the Pi package from that checkout:
+
 ```powershell
-cd D:\Projects\matthew-way-studio
+git clone https://github.com/matthewjameswatkins1978-cyber/matthew-way-studio.git
+cd matthew-way-studio
 npm install
 pi install ./
 ```
