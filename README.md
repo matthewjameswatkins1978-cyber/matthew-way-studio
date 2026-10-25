@@ -16,8 +16,11 @@ Pi owns procedure. There is no orchestration vocabulary to learn: no `/goal`,
 
 ## Install
 
+Clone this repository, then install the Pi package from that checkout:
+
 ```powershell
-cd D:\Projects\matthew-way-studio
+git clone https://github.com/matthewjameswatkins1978-cyber/matthew-way-studio.git
+cd matthew-way-studio
 npm install
 pi install ./
 ```
