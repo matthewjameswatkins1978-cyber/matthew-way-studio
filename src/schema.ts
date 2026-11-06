@@ -14,7 +14,7 @@ import { currentRuleSnapshot, legacyRuleSnapshot, parseRuleSnapshot, type RuleSn
 
 export const SCHEMA_VERSION = 3;
 
-export const STATUSES = ["WORKING", "WAITING_REVIEW", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"] as const;
+export const STATUSES = ["WORKING", "WAITING_REVIEW", "WAITING_HANDOFF", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"] as const;
 export type JobStatus = (typeof STATUSES)[number];
 
 export type BlockerKind =
@@ -146,6 +146,29 @@ export interface ReviewWaitTarget {
   requested_review: "general" | "approval" | "correction";
   requested_at: string;
 }
+/**
+ * Durable handoff-wait target for WAITING_HANDOFF (peer handoffs, not reviews).
+ *
+ * Mirrors ReviewWaitTarget discipline: exact run/worker/branch/head identity so a
+ * wake can only fire for the intended worker on the recorded checkout.
+ */
+export interface HandoffWaitTarget {
+  run_id: string;
+  role: string;
+  repository: string;
+  issue: number;
+  /** Highest GitHub comment id already observed; the poll cursor. */
+  cursor: string;
+  /** Peer role expected to hand off, when known. */
+  expected_from?: string;
+  /** Handoff message type required, when known. */
+  required_type?: string;
+  branch: string;
+  head_sha: string;
+  job_id: string;
+  worker_session_id: string;
+  entered_at: string;
+}
 export interface JobState extends JobContract {
   schema_version: number;
   job_id: string;
@@ -158,6 +181,7 @@ export interface JobState extends JobContract {
   memory: JobMemory;
   blocker?: JobBlocker;
   review_wait?: ReviewWaitTarget;
+  handoff_wait?: HandoffWaitTarget;
   human_dogfood: JobDogfood;
   continuation: JobContinuation;
   /** Exact operating rules pinned when the mission began. */
@@ -173,8 +197,9 @@ export interface JobState extends JobContract {
  * state is idempotent instead of throwing at a tool boundary.
  */
 const TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
-  WORKING: ["WORKING", "WAITING_REVIEW", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"],
+  WORKING: ["WORKING", "WAITING_REVIEW", "WAITING_HANDOFF", "NEEDS_HUMAN", "COMPLETE", "PARTIAL", "FAILED"],
   WAITING_REVIEW: ["WAITING_REVIEW", "WORKING", "NEEDS_HUMAN", "FAILED"],
+  WAITING_HANDOFF: ["WAITING_HANDOFF", "WORKING", "NEEDS_HUMAN", "FAILED"],
   NEEDS_HUMAN: ["NEEDS_HUMAN", "WORKING", "FAILED"],
   COMPLETE: ["COMPLETE", "WORKING"],
   PARTIAL: ["PARTIAL", "WORKING"],
@@ -249,6 +274,32 @@ function normalizeReviewWait(value: unknown): ReviewWaitTarget | undefined {
   }
   return target;
 }
+/** Accept an unknown handoff-wait blob or reject it; same strictness as review waits. */
+function normalizeHandoffWait(value: unknown): HandoffWaitTarget | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null) throw new JobParseError("handoff_wait is not an object");
+  const raw = value as Record<string, unknown>;
+  const target: HandoffWaitTarget = {
+    run_id: str(raw.run_id),
+    role: str(raw.role),
+    repository: str(raw.repository),
+    issue: clampInt(raw.issue, 0, 0),
+    cursor: str(raw.cursor),
+    branch: str(raw.branch),
+    head_sha: str(raw.head_sha),
+    job_id: str(raw.job_id),
+    worker_session_id: str(raw.worker_session_id),
+    entered_at: str(raw.entered_at),
+  };
+  const expectedFrom = str(raw.expected_from);
+  if (expectedFrom) target.expected_from = expectedFrom;
+  const requiredType = str(raw.required_type);
+  if (requiredType) target.required_type = requiredType;
+  if (!target.run_id || !target.role || !target.repository || !target.issue || !target.cursor || !target.branch || !/^[0-9a-f]{40}$/i.test(target.head_sha) || !target.job_id || !target.worker_session_id || !target.entered_at) {
+    throw new JobParseError("handoff_wait is missing its exact run, role, inbox, branch, head, job or worker identity");
+  }
+  return target;
+}
 export function normalizeJob(raw: unknown): JobState {
   if (typeof raw !== "object" || raw === null) throw new JobParseError("job state is not an object");
   const obj = raw as Record<string, unknown>;
@@ -291,6 +342,7 @@ export function normalizeJob(raw: unknown): JobState {
     ...(typeof obj.worker_session_id === "string" && obj.worker_session_id ? { worker_session_id: obj.worker_session_id } : {}),
     status,
     ...(obj.review_wait === undefined ? {} : { review_wait: normalizeReviewWait(obj.review_wait) }),
+    ...(obj.handoff_wait === undefined ? {} : { handoff_wait: normalizeHandoffWait(obj.handoff_wait) }),
     objective: str(obj.objective),
     scope: strList(obj.scope),
     authority: strList(obj.authority),
@@ -389,7 +441,11 @@ export function normalizeJob(raw: unknown): JobState {
   if (job.review_wait && (job.review_wait.job_id !== job.job_id || job.review_wait.branch !== job.repo.branch || job.review_wait.head_sha.toLowerCase() !== job.repo.current_sha.toLowerCase())) {
     throw new JobParseError("review_wait identity does not match its job, branch and current head SHA");
   }
+  if (job.handoff_wait && (job.handoff_wait.job_id !== job.job_id || job.handoff_wait.branch !== job.repo.branch || job.handoff_wait.head_sha.toLowerCase() !== job.repo.current_sha.toLowerCase())) {
+    throw new JobParseError("handoff_wait identity does not match its job, branch and current head SHA");
+  }
   if (job.status === "WAITING_REVIEW" && !job.review_wait) throw new JobParseError("WAITING_REVIEW has no exact review target");
+  if (job.status === "WAITING_HANDOFF" && !job.handoff_wait) throw new JobParseError("WAITING_HANDOFF has no exact handoff target");
   if (!job.objective) throw new JobParseError("job state has no objective");
   return job;
 }
