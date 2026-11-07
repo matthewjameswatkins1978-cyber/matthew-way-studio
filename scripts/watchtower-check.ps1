@@ -77,7 +77,7 @@ function ConvertTo-Handoff([object]$c, [string]$repo) {
     from       = $m.Groups[4].Value
     sha        = $m.Groups[5].Value
     created_at = [string]$c.created_at
-    snippet    = ([string]$c.body).Substring(0, [Math]::Min(200, ([string]$c.body).Length))
+    snippet    = ([string]$c.body).Substring(0, [Math]::Min(2000, ([string]$c.body).Length))
   }
 }
 
@@ -146,7 +146,8 @@ if ($Dispatch -and -not $stopped) {
   foreach ($h in $handoffs) {
     $seat = $cfg.seats | Where-Object { $_.roles -contains $h.to -and ($null -eq $_.runs -or $_.runs.Count -eq 0 -or $_.runs -contains $h.run_id) } | Select-Object -First 1
     if ($null -eq $seat) { continue }
-    $packet = "WORKSHOP WAKE $($h.to): $($h.from) ($($h.type)) comment #$($h.id). Verify the pinned receipt and continue. Envelope sha: $($h.sha)."
+    $taskText = if ($h.snippet.Length -gt 500) { $h.snippet.Substring(0, 500) } else { $h.snippet }
+    $packet = "WORKSHOP WAKE $($h.to): $($h.from) ($($h.type)) comment #$($h.id). Verify the pinned receipt and continue. Envelope sha: $($h.sha). Task: $taskText. When done, reply with one line ACK $($h.id) and stop."
     $log = Join-Path $StateDir "dispatch-$($h.id).log"
     try {
       $p = Start-Process -FilePath "pi" -ArgumentList "--print", "--session-id", $seat.sessionId, $packet -WorkingDirectory $seat.cwd -RedirectStandardOutput $log -Wait -PassThru
