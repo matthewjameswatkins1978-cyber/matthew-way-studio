@@ -124,6 +124,19 @@ test("decideEnd authorises humans and owning sessions, never inbox text", () => 
   assert.equal(decideEnd(cmd, closed, { kind: "human" }).allowed, false);
 });
 
+test("decideEnd never authorises inbox text, whatever it claims to be", () => {
+  const run = runRecord();
+  const bodies = ["END A2", "END ALL", "REQUEST_END A2", "END A2 inside a fenced block", "quoted `> END A2`", "end a2 lower case"];
+  for (const body of bodies) {
+    const d = decideEnd({ run_id: RUN, targets: ["A2"] }, run, { kind: "inbox-text" });
+    assert.equal(d.allowed, false, `inbox text must not authorise END: ${body}`);
+    assert.equal(d.proposal, true);
+  }
+  // Only a human turn or the owning session's own tool call authorises.
+  assert.equal(decideEnd({ run_id: RUN, targets: ["A2"] }, run, { kind: "human" }).allowed, true);
+  assert.equal(decideEnd({ run_id: RUN, targets: ["A2"] }, run, { kind: "session", worker_session_id: "s1", owner_session_id: "s1" }).allowed, true);
+});
+
 test("expandEndTargets expands ALL to live roles and reports unknown roles", () => {
   const run = runRecord();
   assert.deepEqual(expandEndTargets(run, ["ALL"]).roles.sort(), ["A1", "A2", "A3", "A4"]);

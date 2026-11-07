@@ -28,6 +28,12 @@
 .PARAMETER PiTimeoutSec
   Per-slice cap for the launched pi process (default 600).
 
+.PARAMETER StopFile
+  Path to a STOP flag file. When present, the script NEVER dispatches:
+  it runs the read-only check and reports stopped:true. This is the manual
+  override - "stop all agents" means creating this file (plus disabling
+  the scheduled task); no model, timer or slice can act past it.
+
 .PARAMETER SelfTest
   Switch: run the offline parser/id-compare self-test on canned fixtures, no network.
 
@@ -42,10 +48,14 @@ param(
   [string]$Config = "",
   [switch]$Dispatch,
   [int]$PiTimeoutSec = 600,
+  [string]$StopFile = "",
   [switch]$SelfTest
 )
 
 $ErrorActionPreference = "Stop"
+
+$stopped = $false
+if (-not [string]::IsNullOrWhiteSpace($StopFile) -and (Test-Path $StopFile)) { $stopped = $true }
 
 function Compare-DecimalId([string]$a, [string]$b) {
   if ($a.Length -ne $b.Length) { return ($a.Length -lt $b.Length) ? -1 : 1 }
@@ -117,7 +127,7 @@ foreach ($c in ($comments | Sort-Object { [int64]$_.id })) {
 }
 
 $dispatched = @()
-if ($Dispatch) {
+if ($Dispatch -and -not $stopped) {
   if ([string]::IsNullOrWhiteSpace($Config) -or -not (Test-Path $Config)) { Write-Error "Dispatch needs -Config watchtower.json."; exit 1 }
   $cfg = Get-Content $Config -Raw | ConvertFrom-Json
   foreach ($h in $handoffs) {
@@ -148,5 +158,6 @@ if ($Dispatch) {
   max_id     = $maxId
   handoffs   = $handoffs
   dispatched = $dispatched
+  stopped    = $stopped
 } | ConvertTo-Json -Depth 5 -Compress
 exit 0

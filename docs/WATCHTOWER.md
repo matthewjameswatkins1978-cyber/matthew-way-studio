@@ -49,7 +49,7 @@ pwsh -File scripts/Install-WatchtowerTask.ps1 -Config .\watchtower.json
 Enable-ScheduledTask -TaskName Watchtower-BoardCheck   # Matthew only
 ```
 
-Kill switch: `Disable-ScheduledTask -TaskName Watchtower-BoardCheck`.
+Kill switch (either works; both is safest): `Disable-ScheduledTask -TaskName Watchtower-BoardCheck`, and/or create the STOP flag file passed via -StopFile (the check then runs read-only and reports stopped:true — no dispatch, no model turn, exit 0).
 Cost control: the timer itself is free (`gh` API only); a model turn
 spawns solely for addressed work, one slice, capped by `-PiTimeoutSec`.
 
