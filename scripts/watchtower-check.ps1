@@ -103,9 +103,18 @@ $slug = $Repository -replace '[^A-Za-z0-9]+', '-'
 $cursorFile = Join-Path $StateDir "$slug-$Issue.cursor"
 $cursor = ""
 if (Test-Path $cursorFile) { $cursor = (Get-Content $cursorFile -Raw).Trim() }
+$sinceFile = Join-Path $StateDir "$slug-$Issue.since"
+$sinceArgs = @()
+if (Test-Path $sinceFile) {
+  # Fetch optimisation only: subtract a 1h margin so clock skew or late
+  # edits cannot hide a comment the id cursor has not scanned yet.
+  $sinceStored = [datetime](Get-Content $sinceFile -Raw).Trim()
+  $sinceArgs = @("-F", ("since=" + $sinceStored.AddHours(-1).ToUniversalTime().ToString("o")))
+}
 
 try {
-  $raw = gh api "repos/$Repository/issues/$Issue/comments" --paginate --method GET -F per_page=100 2>&1 | Out-String
+  $apiArgs = @("repos/$Repository/issues/$Issue/comments", "--paginate", "--method", "GET", "-F", "per_page=100") + $sinceArgs
+  $raw = gh api @apiArgs 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) { throw "gh exit $LASTEXITCODE" }
   $pages = $raw | ConvertFrom-Json
 } catch {
@@ -117,14 +126,18 @@ foreach ($page in @($pages)) { foreach ($entry in @($page)) { $comments += $entr
 if ($comments.Count -gt 2000) { $comments = $comments | Select-Object -Last 2000 }
 
 $maxId = ""
+$maxCreated = ""
 $handoffs = @()
 foreach ($c in ($comments | Sort-Object { [int64]$_.id })) {
   $idStr = [string]$c.id
   if ($maxId -eq "" -or (Compare-DecimalId $idStr $maxId) -gt 0) { $maxId = $idStr }
+  if ([string]$c.created_at -gt $maxCreated) { $maxCreated = [string]$c.created_at }
   if ($cursor -ne "" -and (Compare-DecimalId $idStr $cursor) -le 0) { continue }
   $h = ConvertTo-Handoff $c $Repository
   if ($null -ne $h) { $handoffs += $h }
 }
+
+if ($maxCreated -ne "") { Set-Content -Path $sinceFile -Value $maxCreated -NoNewline }
 
 $dispatched = @()
 if ($Dispatch -and -not $stopped) {

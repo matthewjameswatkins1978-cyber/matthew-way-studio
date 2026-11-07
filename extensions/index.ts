@@ -30,7 +30,7 @@ import { acknowledgeReview, importReviewComment, listPendingReviews, readPullReq
 import { fetchIssueComments } from "../src/inbox.js";
 import { applyWake } from "../src/mission.js";
 import { nextPollDelayMs, type HandoffMsg } from "../src/sleepwake.js";
-import { tickWaitingJob } from "../src/watch.js";
+import { shouldKeepWatching, tickWaitingJob } from "../src/watch.js";
 import { readHeartbeat } from "../src/workshop.js";
 import { discoverLanternTools, lanternContextResult, readSnapshot } from "../src/lantern.js";
 import { isSubstantivePacket, classifyInstruction, detectControlIntent, detectLegacyAdoptionIntent, detectReviewRecoveryIntent, explicitMissionResume, looksLikeResumeAttempt } from "../src/packet.js";
@@ -530,7 +530,7 @@ function scheduleSleepTick(
     if (!cur) return;
     const read = readJob(location);
     const live = read.kind === "loaded" ? read.job : undefined;
-    if (live && live.job_id === jobId && live.status === "WAITING_HANDOFF") {
+    if (live && live.job_id === jobId && shouldKeepWatching(live)) {
       scheduleSleepTick(pi, location, jobId, workerSessionId, cwd, pollIntervalMs, key, nextPollDelayMs(pollIntervalMs, cur.failures, workerSessionId));
     } else {
       clearSleepWatcher(key);
@@ -550,7 +550,7 @@ function runSleepTick(
 ): { woke?: string; deferred?: string; error?: string; fetched: number; matched: number } {
   const read = readJob(location);
   const job = read.kind === "loaded" ? read.job : undefined;
-  if (!job || job.job_id !== jobId || job.status !== "WAITING_HANDOFF" || !job.handoff_wait) {
+  if (!job || job.job_id !== jobId || !job.handoff_wait || !shouldKeepWatching(job)) {
     if (key) clearSleepWatcher(key);
     return { fetched: 0, matched: 0, error: "no active handoff wait" };
   }
@@ -631,7 +631,7 @@ export function registerStudio(pi: PiApi): void {
     // Arm the handoff inbox poll for a waiting mission: the timer keeps this
     // live session listening while the wait holds. Re-arming is idempotent
     // (prior timer cleared); a non-waiting job leaves any timer cleared.
-    if (job && attached && job.status === "WAITING_HANDOFF" && job.handoff_wait) {
+    if (job && attached && shouldKeepWatching(job)) {
       const workerSessionId = ctx.sessionManager?.getSessionId?.() ?? rt.location.workerId ?? "legacy";
       armSleepWatcher(pi, rt.location, job, workerSessionId, ctx.cwd, rt.config.handoffPollMs ?? 180_000, sleepKeyFor(ctx));
     } else {
@@ -658,16 +658,21 @@ export function registerStudio(pi: PiApi): void {
     const pendingWake = pendingWakes.get(sleepKey);
     if (pendingWake) {
       pendingWakes.delete(sleepKey);
-      if (job && job.status === "WAITING_HANDOFF" && job.job_id === pendingWake.jobId && Date.now() - pendingWake.at <= PENDING_WAKE_TTL_MS) {
+      if (job && job.job_id === pendingWake.jobId && Date.now() - pendingWake.at <= PENDING_WAKE_TTL_MS && (job.status === "WAITING_HANDOFF" || (job.status === "WORKING" && job.handoff_wait))) {
         const wakeRes = runMutation(rt, ctx, "wake", (fresh) =>
           fresh.status === "WAITING_HANDOFF" && fresh.job_id === pendingWake.jobId
             ? applyWake(fresh, { comment_id: pendingWake.commentId, from: pendingWake.from, type: pendingWake.type })
             : undefined,
         );
-        if (wakeRes.ok && wakeRes.job) {
+        if (job.status === "WORKING") {
+          // Already working with a retained handoff target: no transition,
+          // just attach the verified handoff. The seat keeps listening.
+          appendEvent(rt.location, "handoff-delivered", { job_id: job.job_id, comment_id: pendingWake.commentId, from: pendingWake.from, type: pendingWake.type });
+          withSection(event, `STUDIO: handoff from ${pendingWake.from} (${pendingWake.type}, comment ${pendingWake.commentId}) arrived while working: verify the pinned receipt and continue. You stay listening; finish or stop the mission to end the watch.`);
+        } else if (wakeRes.ok && wakeRes.job) {
           appendEvent(rt.location, "handoff-wake", { job_id: wakeRes.job.job_id, comment_id: pendingWake.commentId, from: pendingWake.from, type: pendingWake.type });
           updateStatus(ctx, wakeRes.job, rt.config, attached);
-          withSection(event, `STUDIO: woken by handoff from ${pendingWake.from} (${pendingWake.type}, comment ${pendingWake.commentId}): verify the pinned receipt and continue.`);
+          withSection(event, `STUDIO: woken by handoff from ${pendingWake.from} (${pendingWake.type}, comment ${pendingWake.commentId}): verify the pinned receipt and continue. You stay listening; finish or stop the mission to end the watch.`);
         } else {
           safeNotify(ctx, `studio: handoff wake refused — ${wakeRes.reason ?? "job left the wait"}.`, "warning");
         }

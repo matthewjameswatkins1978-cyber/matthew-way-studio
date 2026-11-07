@@ -53,6 +53,26 @@ Kill switch (either works; both is safest): `Disable-ScheduledTask -TaskName Wat
 Cost control: the timer itself is free (`gh` API only); a model turn
 spawns solely for addressed work, one slice, capped by `-PiTimeoutSec`.
 
+## 4b. Repeat-reliability contract (park → wake → work → wake again)
+
+Listening is persistent, not a one-shot: entering `WAITING_HANDOFF`
+retains the handoff target, and a wake keeps it (`applyWake` preserves
+`handoff_wait`). The inbox timer stays armed while the job is waiting
+or working with a retained target, and stands down only on terminal
+states, an explicit stop, or process shutdown. A woken seat therefore
+does NOT need to remember to re-park — the next handoff wakes it again
+(`shouldKeepWatching` in `src/watch.ts`, unit-tested). Finishing or
+stopping the mission ends the watch.
+
+Zero-empty-turns rule: timer ticks perform only `gh` fetches and file
+heartbeats — no model calls, ever. Only a matched, verified handoff
+fires `sendWake` (one turn), or a dispatch slice (one `pi --print`).
+Measurement protocol for the joint test: during an agreed quiet window
+(>=15 min, no handoffs posted), the seat records heartbeat tick count
+from its run record versus session turn count. Acceptance: ticks > 0,
+turns == 0. Any model turn with no matching handoff in the verdict log
+is a FAIL.
+
 ## 4. Three-agent acceptance test (A4 + two peers)
 
 Preconditions: branch under test pushed; peers launched with stable names;

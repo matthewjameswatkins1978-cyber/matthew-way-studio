@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ensureSleepRun, tickWaitingJob } from "../src/watch.js";
+import { ensureSleepRun, shouldKeepWatching, tickWaitingJob } from "../src/watch.js";
 import type { JobState } from "../src/schema.js";
 import { newJob } from "../src/schema.js";
 import type { HandoffMsg } from "../src/sleepwake.js";
@@ -87,6 +87,14 @@ test("tick returns poll state so the timer loop can persist without re-reading",
   const failed = runTick(d, [], false, true);
   assert.equal(failed.out.state.consecutiveFailures, 1);
   assert.equal(failed.out.state.cursor, "");
+});
+
+test("shouldKeepWatching listens while waiting or working with a retained target", () => {
+  const waiting = waitingJob();
+  assert.equal(shouldKeepWatching(waiting), true);
+  assert.equal(shouldKeepWatching({ ...waiting, status: "WORKING" }), true);
+  assert.equal(shouldKeepWatching({ ...waiting, status: "COMPLETE" }), false);
+  assert.equal(shouldKeepWatching({ ...waiting, handoff_wait: undefined }), false);
 });
 
 test("tick wakes on a matching handoff and persists cursor + delivered id", () => {

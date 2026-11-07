@@ -21,6 +21,18 @@ export interface RunContext {
   nowIso: () => string;
 }
 
+/**
+ * Whether this job should keep a live inbox watcher: waiting for handoff, or
+ * working with a retained handoff target from a previous wake. Terminal jobs
+ * never watch. This is what makes park -> wake -> work -> wake-again reliable
+ * without depending on the model remembering to re-park: the retained target
+ * keeps listening across the woken turn.
+ */
+export function shouldKeepWatching(job: JobState): boolean {
+  if (!job.handoff_wait) return false;
+  return job.status === "WAITING_HANDOFF" || job.status === "WORKING";
+}
+
 export interface TickOutcome {
   reported: { fetched: number; matched: number; woke?: string; deferred?: string; duplicateSuppressed?: string; nextDelayMs: number; error?: string };
   state: { cursor: string; lastFetchIso: string; consecutiveFailures: number };
