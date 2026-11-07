@@ -25,7 +25,7 @@ import { adoptLegacyJob, appendEvent, claimIsAbandoned, claimIsForeign, readJob,
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
-import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyCompletionRefused, applyMemory, applyReviewWait, applyReviewWaitRecovery, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
+import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyCompletionRefused, applyHandoffWait, applyMemory, applyReviewWait, applyReviewWaitRecovery, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
 import { acknowledgeReview, importReviewComment, listPendingReviews, readPullRequest, readReviewDelivery } from "../src/review.js";
 import { fetchIssueComments } from "../src/inbox.js";
 import { applyWake } from "../src/mission.js";
@@ -1144,6 +1144,68 @@ export function registerStudio(pi: PiApi): void {
         return textResult(`WAITING_REVIEW: ${repository} PR #${pr.number} ${pr.branch}@${pr.head_sha}. Automatic continuation is stopped until an authorized decision is validated.`, { job_id: waiting.job_id, worker_session_id: sessionId, repository, pull_request: pr.number, head_sha: pr.head_sha });
       } catch (error) {
         return textResult(`Cannot enter review wait: ${error instanceof Error ? error.message : String(error)}`, undefined, true);
+      }
+    },
+  });
+  pi.registerTool({
+    name: "studio_wait_for_handoff",
+    label: "Studio wait for handoff",
+    description: "Stop autonomous turns and listen for one addressed peer handoff on a GitHub issue inbox. Studio verifies the mission checkout matches the live head before entering WAITING_HANDOFF; the inbox poll wakes this session exactly once when a matching WORKSHOP-HANDOFF envelope arrives.",
+    promptSnippet: "When the mission is pushed and genuinely waiting for a named peer handoff, register the exact run, role, repository and issue, then stop the worker cleanly.",
+    parameters: Type.Object({
+      run_id: Type.String({ description: "Workshop run id the handoff belongs to" }),
+      role: Type.String({ description: "This worker's recipient role (must equal the handoff envelope's to-field)" }),
+      repository: Type.String({ description: "owner/repository of the inbox issue carrying handoffs" }),
+      issue: Type.Integer({ minimum: 1, description: "Issue number whose comments carry WORKSHOP-HANDOFF envelopes" }),
+      expected_from: Type.Optional(Type.String({ description: "Only accept handoffs from this sender role" })),
+      required_type: Type.Optional(Type.String({ description: "Only accept handoffs of this type" })),
+    }),
+    execute: async (_id, params, _signal, _update, ctx) => {
+      const rt = runtimeFor(ctx);
+      const job = jobOf(rt);
+      if (!job) return textResult("No active Studio mission to place in handoff wait.", undefined, true);
+      const detachedWait = detachedMissionRefusal(rt, ctx, "place in handoff wait");
+      if (detachedWait) return textResult(detachedWait, { job_id: job.job_id, detached: true }, true);
+      const sessionId = ctx.sessionManager?.getSessionId?.();
+      if (!sessionId) return textResult("Cannot record WAITING_HANDOFF: this Pi context does not expose a stable session ID.", undefined, true);
+      const run_id = str(params["run_id"]);
+      const role = str(params["role"]);
+      const repository = str(params["repository"]);
+      const issue = num(params["issue"]);
+      if (!run_id || !role || !repository || !issue || !Number.isInteger(issue)) return textResult("run_id, role, repository and issue are all required for a handoff wait.", undefined, true);
+      if (repository.toLowerCase() !== canonicalRepo(job.repo.remote)?.toLowerCase() && repository.toLowerCase() !== job.repo.remote.toLowerCase()) return textResult(`Cannot enter handoff wait: inbox repository ${repository} does not match mission remote ${job.repo.remote}.`, undefined, true);
+      try {
+        let rewaited = true;
+        const waitRes = runMutation(rt, ctx, "place in handoff wait", (fresh) => {
+          const waiting = applyHandoffWait(fresh, {
+            run_id,
+            role,
+            repository,
+            issue,
+            cursor: "",
+            ...(str(params["expected_from"]) ? { expected_from: str(params["expected_from"]) as string } : {}),
+            ...(str(params["required_type"]) ? { required_type: str(params["required_type"]) as string } : {}),
+            branch: rt.facts.branch,
+            head_sha: rt.facts.head_sha,
+            worker_session_id: sessionId,
+          });
+          // An identical re-wait is a no-op and must stay quiet.
+          if (waiting === fresh) {
+            rewaited = false;
+            return undefined;
+          }
+          return waiting;
+        });
+        if (!waitRes.ok) throw new Error(waitRes.reason ?? "refused");
+        const waiting = waitRes.job ?? job;
+        if (rewaited) {
+          appendEvent(rt.location, "handoff-wait", { job_id: waiting.job_id, run_id, role, repository, issue, branch: rt.facts.branch, head_sha: rt.facts.head_sha, worker_session_id: sessionId });
+          safeNotify(ctx, `studio: waiting for handoff · ${run_id} ${role} @ ${repository}#${issue}`, "info");
+        }
+        updateStatus(ctx, waiting, rt.config);
+        return textResult(`WAITING_HANDOFF: ${repository}#${issue} run ${run_id} role ${role}. The inbox poll wakes this session once on a matching handoff; nothing else resumes it.`, { job_id: waiting.job_id, worker_session_id: sessionId, run_id, role, repository, issue, head_sha: rt.facts.head_sha });
+      } catch (error) {
+        return textResult(`Cannot enter handoff wait: ${error instanceof Error ? error.message : String(error)}`, undefined, true);
       }
     },
   });

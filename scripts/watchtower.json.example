@@ -1,0 +1,19 @@
+{
+  "$schema": "watchtower-seats-v1",
+  "seats": [
+    {
+      "seat": "A1",
+      "sessionId": "REPLACE-WITH-A1-SESSION-ID",
+      "cwd": "D:\\Projects\\pepin",
+      "runs": [],
+      "roles": [ "A1" ]
+    },
+    {
+      "seat": "A4",
+      "sessionId": "REPLACE-WITH-A4-SESSION-ID",
+      "cwd": "D:\\Projects\\pepin",
+      "runs": [],
+      "roles": [ "A4" ]
+    }
+  ]
+}
