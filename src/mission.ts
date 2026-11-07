@@ -13,6 +13,7 @@ import {
   terminalStatus,
   type BlockerKind,
   type CheckEvidence,
+  type HandoffWaitTarget,
   type JobState,
 } from "./schema.js";
 import { makeJobId, savePacket } from "./ledger.js";
@@ -153,6 +154,77 @@ export function applyReviewWait(job: JobState, input: ReviewWaitInput): JobState
     blocker: undefined,
     continuation: { ...job.continuation, allowed: false, reason: "waiting for reviewer decision" },
     updated_at: now,
+  };
+}
+/** Enter a durable peer-handoff wait only when every identity matches this job. */
+export interface HandoffWaitInput {
+  run_id: string;
+  role: string;
+  repository: string;
+  issue: number;
+  cursor: string;
+  expected_from?: string;
+  required_type?: string;
+  branch: string;
+  head_sha: string;
+  worker_session_id: string;
+  entered_at?: string;
+}
+/** Enter WAITING_HANDOFF: the model stops inferring and a timer watches the inbox. */
+export function applyHandoffWait(job: JobState, input: HandoffWaitInput): JobState {
+  if (job.status === "WAITING_HANDOFF") {
+    const current: HandoffWaitTarget | undefined = job.handoff_wait;
+    if (current && current.run_id === input.run_id && current.role === input.role && current.worker_session_id === input.worker_session_id) return job;
+    throw new Error("a different handoff wait is already active for this mission");
+  }
+  if (job.status !== "WORKING") throw new Error(`cannot wait for handoff while mission is ${job.status}`);
+  if (!input.run_id || !input.role || !input.repository || !input.issue || !input.branch || !input.worker_session_id) throw new Error("handoff target is missing run, role, repository, issue, branch or worker identity");
+  if (job.repo.branch !== input.branch || job.repo.current_sha.toLowerCase() !== input.head_sha.toLowerCase()) throw new Error("handoff branch or head SHA does not match the mission's current repository state");
+  if (input.head_sha !== input.head_sha.toLowerCase() || !/^[0-9a-f]{40}$/.test(input.head_sha)) throw new Error("handoff head SHA must be a canonical 40-character lowercase SHA");
+  const now = input.entered_at ?? new Date().toISOString();
+  const transitioned = applyTransition(job, "WAITING_HANDOFF");
+  return {
+    ...transitioned,
+    status: "WAITING_HANDOFF",
+    handoff_wait: {
+      run_id: input.run_id,
+      role: input.role,
+      repository: input.repository,
+      issue: input.issue,
+      cursor: input.cursor,
+      ...(input.expected_from ? { expected_from: input.expected_from } : {}),
+      ...(input.required_type ? { required_type: input.required_type } : {}),
+      branch: input.branch,
+      head_sha: input.head_sha.toLowerCase(),
+      job_id: job.job_id,
+      worker_session_id: input.worker_session_id,
+      entered_at: now,
+    },
+    blocker: undefined,
+    continuation: { ...job.continuation, allowed: false, reason: "waiting for peer handoff" },
+    updated_at: now,
+  };
+}
+/** Wake on a verified handoff: resume WORKING, keep the target for provenance. */
+export function applyWake(job: JobState, input: { comment_id: number; from: string; type: string; now?: string }): JobState {
+  if (job.status !== "WAITING_HANDOFF") throw new Error("cannot wake a mission that is not waiting for handoff");
+  const now = input.now ?? new Date().toISOString();
+  const transitioned = applyTransition(job, "WORKING");
+  return {
+    ...transitioned,
+    status: "WORKING",
+    continuation: { ...job.continuation, allowed: true, runs: 0, unchanged_streak: 0, error_streak: 0, reason: `woken by handoff from ${input.from}` },
+    progress: { ...job.progress, next_action: `handoff from ${input.from} (${input.type}, comment ${input.comment_id}): verify the pinned receipt and continue` },
+    updated_at: now,
+  };
+}
+/** Advance the inbox cursor after seen comments; wake eligibility is unchanged. */
+export function applyHandoffCursor(job: JobState, cursor: string, now?: string): JobState {
+  if (job.status !== "WAITING_HANDOFF" || !job.handoff_wait) throw new Error("cannot advance an inbox cursor with no active handoff wait");
+  return {
+    ...job,
+    handoff_wait: { ...job.handoff_wait, cursor },
+    updated_at: now ?? new Date().toISOString(),
   };
 }
 /**

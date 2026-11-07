@@ -36,6 +36,11 @@ export interface StudioConfig extends ContinuationLimits {
    * Matthew instead of resuming work). Defaults to false: reject them.
    */
   allowSameAccountReviews: boolean;
+  /**
+   * Poll interval for WAITING_HANDOFF inbox checks. Default 180000 ms.
+   * Clamped to [10s, 1h]; jitter and backoff are computed per worker.
+   */
+  handoffPollMs?: number;
 }
 
 export const DEFAULT_CONFIG: StudioConfig = {
@@ -46,6 +51,7 @@ export const DEFAULT_CONFIG: StudioConfig = {
   authorizedReviewers: [],
   workerGithubLogins: [],
   allowSameAccountReviews: false,
+  handoffPollMs: 180_000,
   // Workshop default: the read-only lantern-git mirror snapshot. Absent or
   // stale is reported as unavailable, never treated as repository truth.
   lanternMirror: { mirrorPath: "D:/Projects/lantern-git/mirror", maxAgeMinutes: 24 * 60 },
@@ -89,6 +95,7 @@ export function mergeConfig(base: StudioConfig, raw: Partial<StudioConfig>): Stu
       ? [...new Set(raw.workerGithubLogins.filter((v): v is string => typeof v === "string" && /^[A-Za-z0-9-]{1,39}$/.test(v)))].slice(0, 32)
       : base.workerGithubLogins,
     allowSameAccountReviews: raw.allowSameAccountReviews === true ? true : base.allowSameAccountReviews,
+    handoffPollMs: Math.min(3_600_000, Math.max(10_000, positiveInt(raw.handoffPollMs, base.handoffPollMs ?? 180_000))),
     lanternMirror: raw.lanternMirror?.mirrorPath ? { mirrorPath: raw.lanternMirror.mirrorPath, maxAgeMinutes: raw.lanternMirror.maxAgeMinutes } : base.lanternMirror,
   };
 }

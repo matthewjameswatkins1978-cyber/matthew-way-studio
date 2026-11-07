@@ -38,6 +38,8 @@ export interface RunRecord {
   run_id: string;
   repository: string;
   issue: number;
+  /** Pi session that created the run; only it (or a human) may END it. */
+  owner_session_id?: string;
   workers: WorkerEntry[];
   created_at: string;
   updated_at: string;
@@ -116,7 +118,7 @@ export function matchWake(worker: WakeContext, msg: HandoffMsg): WakeAssessment 
 }
 
 /** Advance a poll cursor past a batch; empty batches keep the old cursor. */
-export function advanceCursor(current: string, messages: HandoffMsg[]): string {
+export function advanceCursor(current: string, messages: { id: string }[]): string {
   let best = current;
   for (const msg of messages) {
     if (!isDecimalId(msg.id)) continue;

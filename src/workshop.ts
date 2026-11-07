@@ -65,6 +65,7 @@ export function normalizeRunRecord(raw: unknown): RunRecord {
     run_id: runId,
     repository: str(raw.repository),
     issue: typeof raw.issue === "number" && Number.isSafeInteger(raw.issue) ? raw.issue : 0,
+    ...(typeof raw.owner_session_id === "string" && raw.owner_session_id ? { owner_session_id: raw.owner_session_id } : {}),
     workers,
     created_at: str(raw.created_at),
     updated_at: str(raw.updated_at),
@@ -190,4 +191,36 @@ export function maxDeliveredId(location: LedgerLocation, runId: string): string 
     if (best === "" || compareIds(id, best) > 0) best = id;
   }
   return best;
+}
+
+/** Read the run record, creating it with the caller as owner when absent. */
+export function ensureRunRecord(
+  location: LedgerLocation,
+  init: { run_id: string; repository: string; issue: number; owner_session_id: string },
+): RunRecord {
+  const existing = readRunRecord(location, init.run_id);
+  if (existing) return existing;
+  const now = new Date().toISOString();
+  const record: RunRecord = {
+    run_id: init.run_id,
+    repository: init.repository,
+    issue: init.issue,
+    workers: [],
+    owner_session_id: init.owner_session_id,
+    created_at: now,
+    updated_at: now,
+  };
+  writeRunRecord(location, record);
+  return record;
+}
+
+/** Add or refresh one worker entry; membership writes stay owner-side. */
+export function upsertWorker(location: LedgerLocation, runId: string, entry: WorkerEntry): RunRecord | undefined {
+  const record = readRunRecord(location, runId);
+  if (!record) return undefined;
+  const idx = record.workers.findIndex((w) => w.role === entry.role);
+  if (idx >= 0) record.workers[idx] = entry;
+  else record.workers.push(entry);
+  writeRunRecord(location, record);
+  return record;
 }

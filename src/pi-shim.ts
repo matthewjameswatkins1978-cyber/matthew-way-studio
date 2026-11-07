@@ -127,6 +127,15 @@ export interface PiApi {
   on(event: "session_shutdown", handler: (event: { type: "session_shutdown"; reason: string }, ctx: PiContext) => Promise<void> | void): () => void;
   registerTool(def: PiToolDefinition): void;
   registerCommand?(name: string, options: { description?: string; handler: (args: string, ctx: PiContext) => Promise<void> }): void;
+  /**
+   * Inject a custom message, optionally waking an idle session. Verified
+   * against the installed Pi 1.5.0 docs: deliverAs "followUp" waits for the
+   * agent to finish, triggerTurn fires a turn only when idle.
+   */
+  sendMessage?(
+    message: { customType: string; content: string; display?: boolean; details?: unknown },
+    options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+  ): void;
   sendUserMessage?(content: string): void;
   getAllTools(): PiToolInfo[];
 }
