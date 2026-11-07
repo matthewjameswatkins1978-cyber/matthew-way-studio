@@ -109,7 +109,10 @@ export function matchWake(worker: WakeContext, msg: HandoffMsg): WakeAssessment 
   if (worker.cursor !== "" && compareIds(msg.id, worker.cursor) <= 0) {
     return { wake: false, reason: "ignore: duplicate or already-acknowledged message" };
   }
-  if (msg.created_at < worker.entered_at) return { wake: false, reason: "ignore: stale message from before this wait began" };
+  const msgMs = Date.parse(msg.created_at);
+  const enteredMs = Date.parse(worker.entered_at);
+  if (!Number.isFinite(msgMs) || !Number.isFinite(enteredMs)) return { wake: false, reason: "ignore: unparseable timestamp cannot prove handoff freshness" };
+  if (msgMs < enteredMs) return { wake: false, reason: "ignore: stale message from before this wait began" };
   if (msg.sha !== undefined && worker.head_sha !== undefined && msg.sha.toLowerCase() !== worker.head_sha.toLowerCase()) {
     return { wake: false, reason: "ignore: message-bound SHA does not match this checkout" };
   }
@@ -160,7 +163,7 @@ export function decideEnd(cmd: EndCommand, run: RunRecord, issuer: EndIssuer): E
     return { allowed: false, proposal: false, reason: "refuse: run is already closed" };
   }
   if (issuer.kind === "inbox-text") {
-    return { allowed: true, proposal: true, reason: "proposal: inbox text can only request END, never authorise it" };
+    return { allowed: false, proposal: true, reason: "proposal: inbox text can only request END, never authorise it" };
   }
   if (issuer.kind === "human") return { allowed: true, proposal: false, reason: "allow: human turn" };
   if (issuer.worker_session_id === issuer.owner_session_id) {

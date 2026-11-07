@@ -23,6 +23,7 @@ export interface RunContext {
 
 export interface TickOutcome {
   reported: { fetched: number; matched: number; woke?: string; deferred?: string; duplicateSuppressed?: string; nextDelayMs: number; error?: string };
+  state: { cursor: string; lastFetchIso: string; consecutiveFailures: number };
   woke: boolean;
   error?: string;
 }
@@ -45,7 +46,7 @@ export function tickWaitingJob(
   },
 ): TickOutcome {
   const delivered = new Set(readDeliveredIds(run.location, wait.run_id));
-  const { report } = pollOnce(
+  const { state, report } = pollOnce(
     { cursor: wait.cursor, lastFetchIso: "", consecutiveFailures: 0 },
     {
       run_id: wait.run_id,
@@ -87,7 +88,7 @@ export function tickWaitingJob(
     run.pollIntervalMs,
     run.workerSessionId,
   );
-  return { reported: { fetched: report.fetched, matched: report.matched, ...(report.woke ? { woke: report.woke } : {}), ...(report.deferred ? { deferred: report.deferred } : {}), ...(report.duplicateSuppressed ? { duplicateSuppressed: report.duplicateSuppressed } : {}), nextDelayMs: report.nextDelayMs, ...(report.error ? { error: report.error } : {}) }, woke: report.woke !== undefined, error: report.error };
+  return { state, reported: { fetched: report.fetched, matched: report.matched, ...(report.woke ? { woke: report.woke } : {}), ...(report.deferred ? { deferred: report.deferred } : {}), ...(report.duplicateSuppressed ? { duplicateSuppressed: report.duplicateSuppressed } : {}), nextDelayMs: report.nextDelayMs, ...(report.error ? { error: report.error } : {}) }, woke: report.woke !== undefined, error: report.error };
 }
 
 /** Apply a verified wake to the job: WORKING with the handoff as next action. */

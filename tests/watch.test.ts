@@ -78,6 +78,17 @@ function sleepRun(d: string, w: ReturnType<typeof worker> = worker()) {
     { run_id: "run-1", repository: "o/r", issue: 16, owner_session_id: "s1" }, w);
 }
 
+test("tick returns poll state so the timer loop can persist without re-reading", () => {
+  const d = dir();
+  sleepRun(d);
+  const r = runTick(d, [comment(5, HANDOFF)], false, false);
+  assert.equal(r.out.state.cursor, "5");
+  assert.equal(r.out.state.consecutiveFailures, 0);
+  const failed = runTick(d, [], false, true);
+  assert.equal(failed.out.state.consecutiveFailures, 1);
+  assert.equal(failed.out.state.cursor, "");
+});
+
 test("tick wakes on a matching handoff and persists cursor + delivered id", () => {
   const d = dir();
   sleepRun(d, worker({ branch: "b", head_sha: "a".repeat(40) }));

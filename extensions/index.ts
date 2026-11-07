@@ -27,6 +27,11 @@ import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
 import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, applyCompletionRefused, applyMemory, applyReviewWait, applyReviewWaitRecovery, evaluateCompletion, startMission, type BlockerInput } from "../src/mission.js";
 import { acknowledgeReview, importReviewComment, listPendingReviews, readPullRequest, readReviewDelivery } from "../src/review.js";
+import { fetchIssueComments } from "../src/inbox.js";
+import { applyWake } from "../src/mission.js";
+import { nextPollDelayMs, type HandoffMsg } from "../src/sleepwake.js";
+import { tickWaitingJob } from "../src/watch.js";
+import { readHeartbeat } from "../src/workshop.js";
 import { discoverLanternTools, lanternContextResult, readSnapshot } from "../src/lantern.js";
 import { isSubstantivePacket, classifyInstruction, detectControlIntent, detectLegacyAdoptionIntent, detectReviewRecoveryIntent, explicitMissionResume, looksLikeResumeAttempt } from "../src/packet.js";
 import { renderMissionBrief, renderNeedsHuman, renderReceipt } from "../src/receipt.js";
@@ -263,6 +268,10 @@ function statusLine(job: JobState | undefined, config: StudioConfig, attached = 
     const wait = job.review_wait;
     return wait ? `studio: WAITING_REVIEW · PR #${wait.pull_request} @ ${wait.head_sha.slice(0, 7)}` : "studio: WAITING_REVIEW";
   }
+  if (job.status === "WAITING_HANDOFF") {
+    const handoff = job.handoff_wait;
+    return handoff ? `studio: WAITING_HANDOFF · ${handoff.run_id} ${handoff.role} · cursor ${handoff.cursor || "none"}` : "studio: WAITING_HANDOFF";
+  }
   if (job.status === "NEEDS_HUMAN") return `studio: NEEDS_HUMAN — ${job.blocker?.exact_human_need.slice(0, 60) ?? "blocked"}`;
   const milestone = job.progress.milestone ? ` · ${job.progress.milestone.slice(0, 30)}` : "";
   const allowance = config.autoContinue ? ` · turn ${job.continuation.runs}/${config.maxTurns}` : "";
@@ -425,6 +434,160 @@ function seedMission(
   });
 }
 
+/* ---------------- workshop sleep & wake ----------------
+ * One deterministic inbox poll per WAITING_HANDOFF session. Timers live here
+ * (armed on session_start, cleared on session_shutdown); every decision
+ * funnels through watch.ts / sleepwake.ts so the behavior is unit-testable.
+ *
+ * The timer never rewrites the job ledger: cursor durability flows through
+ * the run-record heartbeat + delivered log (reloaded when re-arming), and
+ * the WAITING_HANDOFF -> WORKING transition happens in the woken turn when
+ * before_agent_start consumes a pending wake. A busy agent defers the wake
+ * to the next tick; nothing interrupts a running tool call. A session whose
+ * process is gone has no timer and is visibly OFFLINE (stale heartbeat),
+ * never misleadingly WAITING.
+ */
+
+interface SleepSession {
+  timer?: ReturnType<typeof setTimeout>;
+  busy: boolean;
+  cursor: string;
+  failures: number;
+  lastFetchIso: string;
+}
+
+const sleepSessions = new Map<string, SleepSession>();
+
+function sleepKeyFor(ctx: PiContext | PiToolContext): string {
+  const id = ctx.sessionManager?.getSessionId?.() ?? ctx.sessionManager?.getSessionFile?.() ?? "legacy";
+  return `${ctx.cwd}|${id}`;
+}
+
+function clearSleepWatcher(key: string): void {
+  const st = sleepSessions.get(key);
+  if (st?.timer !== undefined) clearTimeout(st.timer);
+  sleepSessions.delete(key);
+  pendingWakes.delete(key);
+}
+
+interface PendingWake {
+  jobId: string;
+  commentId: number;
+  from: string;
+  type: string;
+  at: number;
+}
+
+const pendingWakes = new Map<string, PendingWake>();
+const PENDING_WAKE_TTL_MS = 10 * 60_000;
+
+function wakeText(msg: HandoffMsg): string {
+  const body = msg.body.length > 200 ? `${msg.body.slice(0, 200)}...` : msg.body;
+  const lines = [`WORKSHOP WAKE ${msg.to}: ${msg.from} (${msg.type}) comment #${msg.id}`, body, "Verify the pinned receipt and continue."];
+  return lines.join("\n");
+}
+
+function armSleepWatcher(
+  pi: PiApi,
+  location: LedgerLocation,
+  job: JobState,
+  workerSessionId: string,
+  cwd: string,
+  pollIntervalMs: number,
+  key: string,
+): void {
+  const wait = job.handoff_wait;
+  if (!wait) return;
+  clearSleepWatcher(key);
+  const prior = readHeartbeat(location, wait.run_id, wait.role);
+  sleepSessions.set(key, { timer: undefined, busy: false, cursor: prior?.cursor ?? wait.cursor, failures: 0, lastFetchIso: "" });
+  scheduleSleepTick(pi, location, job.job_id, workerSessionId, cwd, pollIntervalMs, key, nextPollDelayMs(pollIntervalMs, 0, workerSessionId));
+}
+
+function scheduleSleepTick(
+  pi: PiApi,
+  location: LedgerLocation,
+  jobId: string,
+  workerSessionId: string,
+  cwd: string,
+  pollIntervalMs: number,
+  key: string,
+  delayMs: number,
+): void {
+  const st = sleepSessions.get(key);
+  if (!st) return;
+  if (st.timer !== undefined) clearTimeout(st.timer);
+  st.timer = setTimeout(() => {
+    let result: { woke?: string; deferred?: string; error?: string; fetched: number; matched: number };
+    try {
+      result = runSleepTick(pi, location, jobId, workerSessionId, cwd, pollIntervalMs, key, false);
+    } catch (error) {
+      appendEvent(location, "watch-tick-crashed", { job_id: jobId, reason: error instanceof Error ? error.message : String(error) });
+      result = { fetched: 0, matched: 0, error: error instanceof Error ? error.message : String(error) };
+    }
+    void result;
+    const cur = sleepSessions.get(key);
+    if (!cur) return;
+    const read = readJob(location);
+    const live = read.kind === "loaded" ? read.job : undefined;
+    if (live && live.job_id === jobId && live.status === "WAITING_HANDOFF") {
+      scheduleSleepTick(pi, location, jobId, workerSessionId, cwd, pollIntervalMs, key, nextPollDelayMs(pollIntervalMs, cur.failures, workerSessionId));
+    } else {
+      clearSleepWatcher(key);
+    }
+  }, delayMs);
+}
+
+function runSleepTick(
+  pi: PiApi,
+  location: LedgerLocation,
+  jobId: string,
+  workerSessionId: string,
+  cwd: string,
+  pollIntervalMs: number,
+  key: string | undefined,
+  assumeIdle: boolean,
+): { woke?: string; deferred?: string; error?: string; fetched: number; matched: number } {
+  const read = readJob(location);
+  const job = read.kind === "loaded" ? read.job : undefined;
+  if (!job || job.job_id !== jobId || job.status !== "WAITING_HANDOFF" || !job.handoff_wait) {
+    if (key) clearSleepWatcher(key);
+    return { fetched: 0, matched: 0, error: "no active handoff wait" };
+  }
+  const wait = job.handoff_wait;
+  const st = key ? sleepSessions.get(key) : undefined;
+  const out = tickWaitingJob(job, wait, { location, pollIntervalMs, workerSessionId, nowIso: () => new Date().toISOString() }, {
+    fetch: (sinceIso) => {
+      const r = fetchIssueComments(wait.repository, wait.issue, sinceIso, cwd);
+      return r.ok ? { ok: true as const, comments: r.fetch.comments } : r;
+    },
+    cwd,
+    isIdle: () => assumeIdle || !(key && (sleepSessions.get(key)?.busy ?? false)),
+    sendWake: (msg) => {
+      if (!pi.sendMessage) throw new Error("installed Pi does not expose sendMessage");
+      if (key) pendingWakes.set(key, { jobId, commentId: Number(msg.id), from: msg.from, type: msg.type, at: Date.now() });
+      pi.sendMessage({ customType: "studio-handoff", content: wakeText(msg), display: true }, { triggerTurn: true, deliverAs: "followUp" });
+    },
+    mutate: (fn) => {
+      // No job-ledger write from the timer path: the cursor is durable in the
+      // heartbeat file and the delivered log, both reloaded when arming.
+      void fn;
+      return { ok: false as const, reason: "timer path is read-only for the job ledger" };
+    },
+    event: (type: string, data: Record<string, unknown>) => appendEvent(location, type, data),
+  });
+  if (st) {
+    st.cursor = out.state.cursor;
+    st.failures = out.state.consecutiveFailures;
+    st.lastFetchIso = out.state.lastFetchIso;
+  }
+  const result: { woke?: string; deferred?: string; error?: string; fetched: number; matched: number } = { fetched: out.reported.fetched, matched: out.reported.matched };
+  if (out.reported.woke) result.woke = out.reported.woke;
+  if (out.reported.deferred) result.deferred = out.reported.deferred;
+  if (out.error) result.error = out.error;
+  return result;
+}
+
 export function registerStudio(pi: PiApi): void {
   // The optional old command now feeds the same ordinary-packet runtime.
   pi.registerCommand?.("studio", {
@@ -465,6 +628,15 @@ export function registerStudio(pi: PiApi): void {
     if (job && attached && lanternToolNames(pi).length === 0) {
       appendEvent(rt.location, "lantern-tools-absent", { job_id: job.job_id });
     }
+    // Arm the handoff inbox poll for a waiting mission: the timer keeps this
+    // live session listening while the wait holds. Re-arming is idempotent
+    // (prior timer cleared); a non-waiting job leaves any timer cleared.
+    if (job && attached && job.status === "WAITING_HANDOFF" && job.handoff_wait) {
+      const workerSessionId = ctx.sessionManager?.getSessionId?.() ?? rt.location.workerId ?? "legacy";
+      armSleepWatcher(pi, rt.location, job, workerSessionId, ctx.cwd, rt.config.handoffPollMs ?? 180_000, sleepKeyFor(ctx));
+    } else {
+      clearSleepWatcher(sleepKeyFor(ctx));
+    }
   });
 
   pi.on("before_agent_start", async (event: PiBeforeAgentStartEvent, ctx) => {
@@ -477,6 +649,30 @@ export function registerStudio(pi: PiApi): void {
     // only non-user origin.
     state.runUser = event.messageType !== "custom";
     state.runOwned = true;
+    // Pending Studio handoff wake: a timer tick already verified the inbox
+    // message and delivered it via sendMessage; this turn applies the
+    // WAITING_HANDOFF -> WORKING transition exactly once, then clears it.
+    const sleepEntry = sleepSessions.get(sleepKeyFor(ctx));
+    if (sleepEntry) sleepEntry.busy = true;
+    const sleepKey = sleepKeyFor(ctx);
+    const pendingWake = pendingWakes.get(sleepKey);
+    if (pendingWake) {
+      pendingWakes.delete(sleepKey);
+      if (job && job.status === "WAITING_HANDOFF" && job.job_id === pendingWake.jobId && Date.now() - pendingWake.at <= PENDING_WAKE_TTL_MS) {
+        const wakeRes = runMutation(rt, ctx, "wake", (fresh) =>
+          fresh.status === "WAITING_HANDOFF" && fresh.job_id === pendingWake.jobId
+            ? applyWake(fresh, { comment_id: pendingWake.commentId, from: pendingWake.from, type: pendingWake.type })
+            : undefined,
+        );
+        if (wakeRes.ok && wakeRes.job) {
+          appendEvent(rt.location, "handoff-wake", { job_id: wakeRes.job.job_id, comment_id: pendingWake.commentId, from: pendingWake.from, type: pendingWake.type });
+          updateStatus(ctx, wakeRes.job, rt.config, attached);
+          withSection(event, `STUDIO: woken by handoff from ${pendingWake.from} (${pendingWake.type}, comment ${pendingWake.commentId}): verify the pinned receipt and continue.`);
+        } else {
+          safeNotify(ctx, `studio: handoff wake refused — ${wakeRes.reason ?? "job left the wait"}.`, "warning");
+        }
+      }
+    }
     if (state.runUser && job) state.humanSinceBlock = true;
     const kind = classifyInstruction(
       prompt,
@@ -852,6 +1048,8 @@ export function registerStudio(pi: PiApi): void {
   });
 
   pi.on("agent_end", async (_event, ctx) => {
+    const sleepDone = sleepSessions.get(sleepKeyFor(ctx));
+    if (sleepDone) sleepDone.busy = false;
     const rt = runtimeFor(ctx);
     const job = jobOf(rt);
     // Status renders with true ownership: a detached conversation must never
@@ -860,6 +1058,10 @@ export function registerStudio(pi: PiApi): void {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    // A closing session stops listening: clear its inbox timer so a
+    // WAITING_HANDOFF ledger row is never mistaken for a live waiter.
+    // Heartbeats go stale, which the roster surfaces as OFFLINE-adjacent.
+    clearSleepWatcher(sleepKeyFor(ctx));
     const rt = runtimeFor(ctx);
     const job = jobOf(rt);
     // Only the owning session annotates its own mission on shutdown; a

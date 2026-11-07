@@ -94,6 +94,21 @@ test("advanceCursor takes the max valid id and keeps the old cursor on empty bat
   assert.equal(advanceCursor("6698000000", [msg({ id: "nope" })]), "6698000000");
 });
 
+test("matchWake compares timestamps as instants, not strings (mixed precision)", () => {
+  const ctx = (entered_at: string) => workerContext({ entered_at, cursor: "" });
+  // A3's exact falsifier: a stale message must NOT wake under any representation.
+  // Old string compare said "…52Z" < "…52.500Z" is false → woke on stale.
+  assert.match(matchWake(ctx("2026-11-07T06:18:52.500Z"), msg({ id: "6698100001", created_at: "2026-11-07T06:18:52Z" })).reason, /stale/);
+  assert.match(matchWake(ctx("2026-11-07T06:18:52.500+00:00"), msg({ id: "6698100001", created_at: "2026-11-07T06:18:52Z" })).reason, /stale/);
+  // Reverse direction: a genuinely newer message MUST wake (old code said stale).
+  assert.equal(matchWake(ctx("2026-11-07T06:18:52Z"), msg({ id: "6698100001", created_at: "2026-11-07T06:18:52.500Z" })).wake, true);
+  // Same instant in another offset form is not older: wakes (as before).
+  assert.equal(matchWake(ctx("2026-11-07T06:18:52+00:00"), msg({ id: "6698100001", created_at: "2026-11-07T06:18:52Z" })).wake, true);
+  // Unparseable timestamps fail closed: no wake without provable freshness.
+  assert.match(matchWake(ctx("not-a-time"), msg({ id: "6698100001" })).reason, /unparseable/);
+  assert.match(matchWake(ctx("2026-11-06T14:00:00Z"), msg({ id: "6698100001", created_at: "not-a-time" })).reason, /unparseable/);
+});
+
 test("decideEnd authorises humans and owning sessions, never inbox text", () => {
   const run = runRecord();
   const cmd = { run_id: RUN, targets: ["A2" as const] };
@@ -102,7 +117,7 @@ test("decideEnd authorises humans and owning sessions, never inbox text", () => 
   const foreign = decideEnd(cmd, run, { kind: "session", worker_session_id: "s9", owner_session_id: "s1" });
   assert.equal(foreign.allowed, false);
   const proposal = decideEnd(cmd, run, { kind: "inbox-text" });
-  assert.equal(proposal.allowed, true);
+  assert.equal(proposal.allowed, false);
   assert.equal(proposal.proposal, true);
   assert.equal(decideEnd({ run_id: "other", targets: ["ALL"] }, run, { kind: "human" }).allowed, false);
   const closed: RunRecord = { ...run, closed: { outcome: "ended", at: "t", by: "human" } };
