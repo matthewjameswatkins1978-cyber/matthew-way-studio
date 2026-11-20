@@ -144,6 +144,21 @@ test("turn error opens an unknown gap; crash goes stale, never billed as active"
   assert.equal(stale.shifts[0]?.working_ms, 5 * MIN);
 });
 
+test("later checkpoints refresh contact: the shift stays WORKING", () => {
+  const t0 = Date.parse("2026-11-20T10:00:00.000Z");
+  const proj = projectShifts(
+    [
+      ev("mission-start", "2026-11-20T10:00:00.000Z"),
+      ev("checkpoint", "2026-11-20T10:25:00.000Z", { milestone: "m", next_action: "n" }),
+    ],
+    t0 + 30 * MIN,
+    15 * MIN,
+  );
+  assert.equal(proj.roster[0]?.availability, "WORKING");
+  assert.equal(proj.roster[0]?.stale, false);
+  assert.equal(proj.roster[0]?.last_event_at, "2026-11-20T10:25:00.000Z");
+});
+
 test("clock skew never produces negative intervals", () => {
   // Complete sorts before start, so it is suppressed (no open shift yet);
   // the shift then opens normally.

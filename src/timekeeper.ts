@@ -515,7 +515,7 @@ export function projectShifts(rawEvents: LedgerEvent[], nowMs: number, staleAfte
     shift.unknown_ms = unknown;
   }
 
-  const roster = buildRoster(shifts, nowMs, staleAfterMs);
+  const roster = buildRoster(shifts, nowMs, staleAfterMs, lastEventByKey);
   return { shifts, roster, suppressed };
 }
 
@@ -535,11 +535,11 @@ function lastContactMs(shift: ShiftRecord): number {
   return last;
 }
 
-function availabilityOf(shift: ShiftRecord, nowMs: number, staleAfterMs: number): Availability {
+function availabilityOf(shift: ShiftRecord, nowMs: number, staleAfterMs: number, lastEventMs?: number): Availability {
   const current = shift.segments[shift.segments.length - 1];
   const state = current?.to ? "unknown" : (current?.state ?? "unknown");
   if (state === "working") {
-    const lastSeen = lastContactMs(shift);
+    const lastSeen = Math.max(lastContactMs(shift), lastEventMs ?? 0);
     if (Number.isFinite(lastSeen) && nowMs - lastSeen > staleAfterMs) return "UNKNOWN";
     return "WORKING";
   }
@@ -548,7 +548,7 @@ function availabilityOf(shift: ShiftRecord, nowMs: number, staleAfterMs: number)
   return "UNKNOWN";
 }
 
-function buildRoster(shifts: ShiftRecord[], nowMs: number, staleAfterMs: number): AgentRosterEntry[] {
+function buildRoster(shifts: ShiftRecord[], nowMs: number, staleAfterMs: number, lastEventByKey?: Map<string, number>): AgentRosterEntry[] {
   const latest = new Map<string, ShiftRecord>();
   for (const shift of shifts) {
     const prev = latest.get(shift.agent);
@@ -556,9 +556,11 @@ function buildRoster(shifts: ShiftRecord[], nowMs: number, staleAfterMs: number)
   }
   const entries: AgentRosterEntry[] = [];
   for (const [agent, shift] of [...latest.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-    const availability = shift.closed_at ? "CLOCKED_OUT" : availabilityOf(shift, nowMs, staleAfterMs);
+    const shiftKey = shift.agent + "|" + shift.job_id;
+    const contactMs = Math.max(Date.parse(shift.opened_at), lastEventByKey?.get(shiftKey) ?? 0);
+    const availability = shift.closed_at ? "CLOCKED_OUT" : availabilityOf(shift, nowMs, staleAfterMs, contactMs);
     const current = shift.segments[shift.segments.length - 1];
-    const lastAt = shift.closed_at ?? current?.from ?? shift.opened_at;
+    const lastAt = shift.closed_at ?? (Number.isFinite(contactMs) ? new Date(contactMs).toISOString() : (current?.from ?? shift.opened_at));
     const lastMs = Date.parse(lastAt);
     const trackable = shift as ShiftRecord & { milestone?: string; next_action?: string };
     const entry: AgentRosterEntry = {
