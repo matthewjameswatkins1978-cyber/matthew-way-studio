@@ -21,7 +21,7 @@ import type {
 } from "../src/pi-shim.js";
 import { customMessage, textResult } from "../src/pi-shim.js";
 import { ledgerLocation, run, type LedgerLocation } from "../src/paths.js";
-import { adoptLegacyJob, appendEvent, claimIsAbandoned, claimIsForeign, readJob, readLegacySnapshot, writeJob, readPacket, saveJobSnapshot, listJobSnapshots, makeSessionToken, mutateJob, withClaimLock, type JobReadResult } from "../src/ledger.js";
+import { adoptLegacyJob, appendEvent, claimIsAbandoned, claimIsForeign, readJob, readLegacySnapshot, writeJob, readPacket, saveJobSnapshot, listJobSnapshots, makeSessionToken, mutateJob, withClaimLock, readEvents, type JobReadResult } from "../src/ledger.js";
 import { decideContinuation } from "../src/continuation.js";
 import { loadConfig, type StudioConfig } from "../src/config.js";
 import { commitFiles, isProtectedBranch, liveDirtyPaths, repoFacts, verifyRemoteSha, pushAndVerify, canonicalRepo, type RepoFacts } from "../src/git.js";
@@ -29,6 +29,9 @@ import { assessBlockerAdmission, applyBlock, applyCheckpoint, applyComplete, app
 import { acknowledgeReview, importReviewComment, listPendingReviews, readPullRequest, readReviewDelivery } from "../src/review.js";
 import { fetchIssueComments } from "../src/inbox.js";
 import { applyWake } from "../src/mission.js";
+import { createHash } from "node:crypto";
+import { formatDuration, formatUK, londonDayKey, parseIntercomFrame, projectShifts, rosterToJson, rosterToText, summarizeDay, TK_INTERRUPTION, TK_WAKE } from "../src/timekeeper.js";
+import { appendTimekeeperEvent, readAllEvents, writeRosterFiles } from "../src/timekeeper-store.js";
 import { nextPollDelayMs, type HandoffMsg } from "../src/sleepwake.js";
 import { shouldKeepWatching, tickWaitingJob } from "../src/watch.js";
 import { readHeartbeat } from "../src/workshop.js";
@@ -42,6 +45,55 @@ import { requestsExecutionHold } from "../src/authority.js";
 
 const STATUS_KEY = "studio";
 const MISSION_SECTION = "studio_mission";
+
+/* ---------------- timekeeper: deterministic shift/availability log ----------------
+ * The projector (src/timekeeper.ts) folds the already-committed host event stream
+ * into shifts; these hooks only add the two events the host owns but Studio does
+ * not otherwise record (intercom wakes, turn interruptions), a restart-resume
+ * marker, and the read-only /timekeeper commands. No model calls, no polling,
+ * no new service. Set STUDIO_TIMEKEEPER_ENABLED=0 to disable recording and
+ * commands without touching the mission ledger.
+ */
+function timekeeperEnabled(): boolean {
+  return process.env.STUDIO_TIMEKEEPER_ENABLED !== "0";
+}
+
+function timekeeperSessionId(ctx: PiContext | PiToolContext): string {
+  return ctx.sessionManager?.getSessionId?.() ?? "legacy";
+}
+
+/** Host-observed intercom wake: record who woke this session, when and why. No message bodies are stored. */
+function recordIntercomWake(ctx: PiContext | PiToolContext, job: JobState, prompt: string): void {
+  if (!timekeeperEnabled()) return;
+  const frame = parseIntercomFrame(prompt);
+  if (!frame) return;
+  try {
+    const at = new Date().toISOString();
+    const trigger = createHash("sha256").update(`${frame.from}|${frame.cwd}|${prompt.length}|${at.slice(0, 16)}`, "utf8").digest("hex").slice(0, 16);
+    appendTimekeeperEvent(runtimeFor(ctx).location, TK_WAKE, {
+      job_id: job.job_id,
+      worker_session_id: timekeeperSessionId(ctx),
+      trigger_id: trigger,
+      from: frame.from,
+      wake_source: "intercom",
+      detail: `intercom wake from ${frame.from}`,
+    }, at);
+  } catch { /* telemetry must not break the run */ }
+}
+
+/** Host-observed turn failure: mark an unknown gap so the interval is never billed as active. The shift stays open. */
+function recordInterruption(ctx: PiContext | PiToolContext, job: JobState, outcome: string, reason: string): void {
+  if (!timekeeperEnabled()) return;
+  try {
+    appendTimekeeperEvent(runtimeFor(ctx).location, TK_INTERRUPTION, {
+      job_id: job.job_id,
+      worker_session_id: timekeeperSessionId(ctx),
+      outcome,
+      reason: reason.slice(0, 200),
+      detail: outcome,
+    });
+  } catch { /* telemetry must not break the run */ }
+}
 
 interface Runtime {
   location: LedgerLocation;
@@ -601,6 +653,50 @@ export function registerStudio(pi: PiApi): void {
       pi.sendUserMessage?.(packet.toLowerCase() === "start" ? "go ahead" : packet);
     },
   });
+  pi.registerCommand?.("timekeeper", {
+    description: "Timekeeper: agent shift roster (status | today | history). Read-only, no model calls.",
+    async handler(args, ctx) {
+      if (!timekeeperEnabled()) {
+        ctx.ui.notify("timekeeper: disabled (STUDIO_TIMEKEEPER_ENABLED=0).", "warning");
+        return;
+      }
+      const sub = (args.trim().split(/\s+/)[0] || "status").toLowerCase();
+      try {
+        const rt = runtimeFor(ctx);
+        const events = readAllEvents(rt.location);
+        const nowMs = Date.now();
+        const proj = projectShifts(events, nowMs);
+        if (sub === "today") {
+          const totals = summarizeDay(proj.shifts, londonDayKey(nowMs), nowMs);
+          const lines = [`timekeeper today · ${formatUK(new Date(nowMs).toISOString(), nowMs)}`];
+          const names = Object.keys(totals).sort();
+          if (names.length === 0) lines.push("no shifts recorded yet.");
+          for (const name of names.slice(0, 50)) {
+            const slot = totals[name];
+            if (!slot) continue;
+            lines.push(`- ${name}: working ${formatDuration(slot.working_ms)}, waiting ${formatDuration(slot.waiting_ms)}, blocked ${formatDuration(slot.blocked_ms)}, unknown ${formatDuration(slot.unknown_ms)}`);
+          }
+          ctx.ui.notify(lines.join("\n"), "info");
+          return;
+        }
+        if (sub === "history") {
+          const lines = [`timekeeper history (${proj.shifts.length} shift${proj.shifts.length === 1 ? "" : "s"})`];
+          for (const shift of proj.shifts.slice(-20)) {
+            lines.push(`- ${shift.shift_id} ${shift.agent} ${shift.job_id} ${shift.open_reason}->${shift.closed_at ? shift.close_reason : "open"} · work ${formatDuration(shift.working_ms)} wait ${formatDuration(shift.waiting_ms)} blocked ${formatDuration(shift.blocked_ms)} unknown ${formatDuration(shift.unknown_ms)} · opened ${formatUK(shift.opened_at, nowMs)}${shift.flags.length > 0 ? ` · flags: ${shift.flags.join(",")}` : ""}`);
+          }
+          if (proj.suppressed > 0) lines.push(`duplicates suppressed: ${proj.suppressed}`);
+          ctx.ui.notify(lines.join("\n"), "info");
+          return;
+        }
+        const json = rosterToJson(proj.roster, nowMs);
+        const text = rosterToText(proj.roster, nowMs);
+        writeRosterFiles(rt.location.dir, json, text);
+        ctx.ui.notify(text, "info");
+      } catch (error) {
+        ctx.ui.notify(`timekeeper: roster unavailable — ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+    },
+  });
   pi.on("session_start", async (event, ctx) => {
     const rt = runtimeFor(ctx);
     const job = jobOf(rt);
@@ -637,6 +733,18 @@ export function registerStudio(pi: PiApi): void {
     } else {
       clearSleepWatcher(sleepKeyFor(ctx));
     }
+    // Restart resume is an actual resume: when the last committed event for
+    // this job closed nothing but the process (session-shutdown), record the
+    // clock-in so the gap is honest and the new shift opens on resume.
+    if (timekeeperEnabled() && job && attached && !terminalStatus(job.status)) {
+      try {
+        const recent = readEvents(rt.location, 200);
+        const last = [...recent].reverse().find((entry) => (entry as { job_id?: unknown }).job_id === job.job_id);
+        if (last && last.type === "session-shutdown") {
+          appendEvent(rt.location, "renewed", { job_id: job.job_id, from: job.status, reason: "session restart" });
+        }
+      } catch { /* advisory */ }
+    }
   });
 
   pi.on("before_agent_start", async (event: PiBeforeAgentStartEvent, ctx) => {
@@ -654,6 +762,9 @@ export function registerStudio(pi: PiApi): void {
     // WAITING_HANDOFF -> WORKING transition exactly once, then clears it.
     const sleepEntry = sleepSessions.get(sleepKeyFor(ctx));
     if (sleepEntry) sleepEntry.busy = true;
+    // A live Intercom delivery wakes this session with a turn whose prompt
+    // carries the broker frame; record the wake causally (who/when/why).
+    if (job && attached) recordIntercomWake(ctx, job, prompt);
     const sleepKey = sleepKeyFor(ctx);
     const pendingWake = pendingWakes.get(sleepKey);
     if (pendingWake) {
@@ -1000,6 +1111,11 @@ export function registerStudio(pi: PiApi): void {
       }
 
       const outcome = event.outcome ?? "completed";
+      // A turn that errored or aborted is host-observed interruption: mark an
+      // unknown gap so the interval is never billed as active. No shift closes.
+      if ((outcome === "error" || outcome === "aborted") && timekeeperEnabled()) {
+        recordInterruption(ctx, job, outcome, `turn ${outcome}`);
+      }
       const decision = decideContinuation(
         job,
         { turnCompleted: outcome === "completed", errored: outcome === "error", aborted: outcome === "aborted" },
