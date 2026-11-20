@@ -275,7 +275,9 @@ test("optional legacy command forwards into the ordinary packet path", async () 
   const sent: string[] = [];
   let handler: ((args: string, ctx: PiContext) => Promise<void>) | undefined;
   harness.api.registerCommand = (name, options) => {
-    assert.equal(name, "studio");
+    // The runtime also registers /timekeeper (read-only roster); this legacy
+    // path only exercises the /studio forwarder.
+    if (name !== "studio") return;
     handler = options.handler;
   };
   harness.api.sendUserMessage = (content) => sent.push(content);
